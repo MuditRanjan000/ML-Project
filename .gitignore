@@ -34,8 +34,8 @@ env.bak/
 venv.bak/
 
 # Project specifics (Data, checkpoints, huge logs)
-data/
-datasets/
+/data/
+/datasets/
 checkpoints/*
 !checkpoints/.gitkeep
 results/raw/*
