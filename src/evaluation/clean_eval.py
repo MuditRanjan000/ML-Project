@@ -20,24 +20,34 @@ def evaluate_clean(
     
     all_logits = []
     all_targets = []
+    all_preds = []
+    all_confs = []
     
     with torch.no_grad():
         for inputs, targets in dataloader:
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
             
-            _, predicted = outputs.max(1)
+            probs = torch.softmax(outputs, dim=1)
+            confs, predicted = probs.max(1)
+            
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
             
             all_logits.append(outputs.cpu())
             all_targets.append(targets.cpu())
+            all_preds.append(predicted.cpu())
+            all_confs.append(confs.cpu())
             
     metrics = calculate_top1_metrics(correct, total)
     
     # Compute ECE
     logits = torch.cat(all_logits, dim=0)
     targets = torch.cat(all_targets, dim=0)
+    preds = torch.cat(all_preds, dim=0)
+    confs = torch.cat(all_confs, dim=0)
+    indices = torch.arange(total)
+    
     ece_val = compute_ece(logits, targets, temperature=temperature, n_bins=num_ece_bins)
     
     return {
@@ -45,5 +55,8 @@ def evaluate_clean(
         "clean_top1_error": metrics["error"],
         "ece": ece_val,
         "logits": logits,
-        "targets": targets
+        "targets": targets,
+        "predicted_class": preds,
+        "confidence": confs,
+        "image_index": indices
     }

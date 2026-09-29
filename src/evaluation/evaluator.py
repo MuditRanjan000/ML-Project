@@ -31,14 +31,32 @@ class Evaluator:
         Executes calibration, clean evaluation, and robustness evaluation.
         Loads validation-selected best checkpoint.
         """
-        # Load best model
-        best_model_path = Path(self.config.get("experiment", {}).get("output_dir", "results")) / run_id / "checkpoints" / "best_model.pt"
+        # Load best model metadata
+        ckpt_dir = Path(self.config.get("experiment", {}).get("output_dir", "results")) / run_id / "checkpoints"
+        best_model_path = ckpt_dir / "best_model.pt"
+        metadata_path = ckpt_dir / "metadata.json"
+        
+        selected_epoch = -1
+        best_val_acc = -1.0
+        
         if best_model_path.exists():
             state = torch.load(best_model_path, map_location="cpu")
             self.model.load_state_dict(state["model_state"])
+            
+        if metadata_path.exists():
+            with open(metadata_path, "r") as f:
+                ckpt_meta = json.load(f)
+                selected_epoch = ckpt_meta.get("epoch", -1)
+                best_val_acc = ckpt_meta.get("best_metric", -1.0)
         
         eval_transform = get_transforms(self.config, is_training=False)
         _, val_loader, test_loader = get_cifar100_dataloaders(self.config, None, eval_transform)
+        
+        # Tracking hashes
+        import hashlib
+        from src.data.split_manager import get_or_create_split
+        _, _, split_hash = get_or_create_split(seed=self.config.get("experiment", {}).get("seed", 42))
+        preproc_hash = hashlib.sha256(repr(eval_transform).encode()).hexdigest()
         
         # 1. Fit Temperature on Clean Validation Set ONLY
         opt_temp = fit_temperature_scaling(self.model, val_loader, self.device)
@@ -61,7 +79,12 @@ class Evaluator:
             "metadata": {
                 "model_name": self.config.get("experiment", {}).get("model_name", "unknown"),
                 "recipe": self.config.get("experiment", {}).get("recipe", "unknown"),
-                "seed": self.config.get("experiment", {}).get("seed", 42)
+                "seed": self.config.get("experiment", {}).get("seed", 42),
+                "checkpoint_identifier": "best_model.pt",
+                "selected_epoch": selected_epoch,
+                "best_validation_accuracy": best_val_acc,
+                "split_hash": split_hash,
+                "preprocessing_config_identifier": preproc_hash
             },
             "metrics": {
                 "Clean Top-1 Acc": clean_res_raw["clean_top1_acc"],

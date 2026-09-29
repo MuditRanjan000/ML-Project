@@ -72,5 +72,42 @@ class TestEvaluationStack(unittest.TestCase):
         self.assertTrue(isinstance(temp, float))
         self.assertTrue(temp > 0) # Temp should be positive scalar
 
+class TestSplitManager(unittest.TestCase):
+    def test_split_persistence(self):
+        from src.data.split_manager import get_or_create_split
+        import shutil
+        
+        test_dir = "tests/test_splits"
+        Path(test_dir).mkdir(exist_ok=True)
+        
+        t1, v1, h1 = get_or_create_split(split_dir=test_dir, seed=123)
+        self.assertEqual(len(t1), 45000)
+        self.assertEqual(len(v1), 5000)
+        
+        # Call again, should load the same
+        t2, v2, h2 = get_or_create_split(split_dir=test_dir, seed=123)
+        self.assertEqual(h1, h2)
+        self.assertEqual(t1[:10], t2[:10])
+        
+        shutil.rmtree(test_dir)
+
+class TestPredictionSchema(unittest.TestCase):
+    def test_clean_predictions(self):
+        from src.evaluation.clean_eval import evaluate_clean
+        from torch.utils.data import TensorDataset, DataLoader
+        
+        model = DummyModel()
+        inputs = torch.randn(4, 3, 32, 32)
+        targets = torch.tensor([0, 1, 1, 0])
+        loader = DataLoader(TensorDataset(inputs, targets), batch_size=2)
+        
+        res = evaluate_clean(model, loader, torch.device("cpu"), temperature=1.0)
+        self.assertIn("predicted_class", res)
+        self.assertIn("confidence", res)
+        self.assertIn("image_index", res)
+        self.assertEqual(res["predicted_class"].shape[0], 4)
+        self.assertEqual(res["confidence"].shape[0], 4)
+        self.assertEqual(res["image_index"].shape[0], 4)
+
 if __name__ == "__main__":
     unittest.main()

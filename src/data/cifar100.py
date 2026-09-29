@@ -29,16 +29,12 @@ def get_cifar100_dataloaders(
         root=str(data_dir), train=False, download=True, transform=eval_transform
     )
     
-    # Deterministic validation split
-    total_train = len(train_full)
-    val_size = int(total_train * val_split)
-    train_size = total_train - val_size
+    # Deterministic validation split via persistent indices
+    from src.data.split_manager import get_or_create_split
     
-    # Use PyTorch generator for reproducible splits
-    generator = torch.Generator().manual_seed(seed)
-    train_dataset, val_dataset = random_split(
-        train_full, [train_size, val_size], generator=generator
-    )
+    train_indices, val_indices, split_hash = get_or_create_split(seed=seed)
+    
+    train_dataset = torch.utils.data.Subset(train_full, train_indices)
     
     # The validation set should ideally use the eval_transform. 
     # Since random_split wraps the dataset, we must manually override its transform or 
@@ -48,7 +44,7 @@ def get_cifar100_dataloaders(
         root=str(data_dir), train=True, download=False, transform=eval_transform
     )
     # Apply the same indices to the clean dataset
-    val_dataset = torch.utils.data.Subset(val_dataset_clean, val_dataset.indices)
+    val_dataset = torch.utils.data.Subset(val_dataset_clean, val_indices)
     
     # Create DataLoaders
     train_loader = DataLoader(
