@@ -1,0 +1,5 @@
+model:
+  architecture: "resnet18"
+  pretrained: false
+  # Specific parameters for CIFAR modification
+  modify_stem: true # Replace 7x7 conv with 3x3 conv for 32x32 images

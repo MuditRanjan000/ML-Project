@@ -1,0 +1,7 @@
+model:
+  architecture: "vit_tiny_patch4_32"
+  pretrained: false
+  patch_size: 4
+  embed_dim: 192
+  depth: 12
+  num_heads: 3

@@ -1,0 +1,18 @@
+# Recipe A: Conventional Baseline
+training:
+  epochs: 100
+  batch_size: 128
+  
+optimizer:
+  name: "sgd"
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 5.0e-4
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+
+augmentation:
+  type: "standard" # RandomCrop, RandomHorizontalFlip

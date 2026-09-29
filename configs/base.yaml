@@ -1,0 +1,13 @@
+# Base configuration for all experiments
+experiment:
+  project_name: "csd361_ml_project"
+  seed: 42
+  output_dir: "results/"
+
+data:
+  dataset: "CIFAR-100"
+  data_dir: "data/cifar100"
+  image_size: 32
+  num_classes: 100
+  num_workers: 4
+  pin_memory: true

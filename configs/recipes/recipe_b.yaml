@@ -1,0 +1,21 @@
+# Recipe B: Modern Composite
+training:
+  epochs: 100
+  batch_size: 128
+  
+optimizer:
+  name: "adamw"
+  lr: 1.0e-3
+  weight_decay: 0.05
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+
+augmentation:
+  type: "modern" # RandAugment, Mixup, Cutmix
+  mixup_alpha: 0.8
+  cutmix_alpha: 1.0
+  rand_augment: "rand-m9-mstd0.5-inc1"
+  label_smoothing: 0.1
