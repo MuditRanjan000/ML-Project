@@ -41,7 +41,8 @@ class TestDataPipeline(unittest.TestCase):
         }
 
     @patch("src.data.cifar100.datasets.CIFAR100", DummyCIFAR100)
-    def test_cifar100_loaders(self):
+    @patch("src.data.split_manager.get_or_create_split", return_value=(list(range(80)), list(range(80, 100)), "dummy"))
+    def test_cifar100_loaders(self, mock_split):
         train_transform = get_transforms(self.config, is_training=True)
         eval_transform = get_transforms(self.config, is_training=False)
 

@@ -34,7 +34,7 @@ class Evaluator:
         # Load best model metadata
         ckpt_dir = Path(self.config.get("experiment", {}).get("output_dir", "results")) / run_id / "checkpoints"
         best_model_path = ckpt_dir / "best_model.pt"
-        metadata_path = ckpt_dir / "metadata.json"
+        metadata_path = ckpt_dir / "best_metadata.json"
         
         selected_epoch = -1
         best_val_acc = -1.0
@@ -46,8 +46,8 @@ class Evaluator:
         if metadata_path.exists():
             with open(metadata_path, "r") as f:
                 ckpt_meta = json.load(f)
-                selected_epoch = ckpt_meta.get("epoch", -1)
-                best_val_acc = ckpt_meta.get("best_metric", -1.0)
+                selected_epoch = ckpt_meta.get("best_epoch", -1)
+                best_val_acc = ckpt_meta.get("best_validation_accuracy", -1.0)
         
         eval_transform = get_transforms(self.config, is_training=False)
         _, val_loader, test_loader = get_cifar100_dataloaders(self.config, None, eval_transform)

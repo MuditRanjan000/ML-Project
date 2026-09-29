@@ -87,7 +87,22 @@ class TestTrainingEngine(unittest.TestCase):
         
         self.assertTrue((Path(self.test_dir) / "latest_model.pt").exists())
         self.assertTrue((Path(self.test_dir) / "best_model.pt").exists())
-        self.assertTrue((Path(self.test_dir) / "metadata.json").exists())
+        self.assertTrue((Path(self.test_dir) / "best_metadata.json").exists())
+        self.assertTrue((Path(self.test_dir) / "latest_metadata.json").exists())
+        
+        # Verify best metadata contents
+        import json
+        with open(Path(self.test_dir) / "best_metadata.json") as f:
+            best_meta = json.load(f)
+        self.assertEqual(best_meta["best_epoch"], 1)
+        self.assertEqual(best_meta["best_validation_accuracy"], metrics["accuracy"])
+        self.assertEqual(best_meta["checkpoint_identifier"], "best_model.pt")
+        
+        # Verify latest metadata contents
+        with open(Path(self.test_dir) / "latest_metadata.json") as f:
+            latest_meta = json.load(f)
+        self.assertEqual(latest_meta["latest_epoch"], 1)
+        self.assertIn("latest_training_state", latest_meta)
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,17 +23,16 @@ class CheckpointManager:
         latest_filename = self.checkpoint_dir / "latest_model.pt"
         torch.save(state_dict, latest_filename)
         
-        # Save metadata
-        metadata = {
-            "epoch": epoch,
-            "metric": metric,
-            "best_metric": max(self.best_metric, metric)
+        latest_metadata = {
+            "latest_epoch": epoch,
+            "latest_training_state": "running",
+            "metric": metric
         }
         if extra_metadata:
-            metadata.update(extra_metadata)
+            latest_metadata.update(extra_metadata)
             
-        with open(self.checkpoint_dir / "metadata.json", "w") as f:
-            json.dump(metadata, f, indent=4)
+        with open(self.checkpoint_dir / "latest_metadata.json", "w") as f:
+            json.dump(latest_metadata, f, indent=4)
         
         # Save best
         if metric > self.best_metric:
@@ -41,6 +40,17 @@ class CheckpointManager:
             self.best_metric = metric
             best_filename = self.checkpoint_dir / "best_model.pt"
             torch.save(state_dict, best_filename)
+            
+            best_metadata = {
+                "best_epoch": epoch,
+                "best_validation_accuracy": metric,
+                "checkpoint_identifier": "best_model.pt"
+            }
+            if extra_metadata:
+                best_metadata.update(extra_metadata)
+                
+            with open(self.checkpoint_dir / "best_metadata.json", "w") as f:
+                json.dump(best_metadata, f, indent=4)
             
     def load_checkpoint(self, filepath: str) -> Dict[str, Any]:
         """

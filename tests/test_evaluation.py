@@ -91,6 +91,24 @@ class TestSplitManager(unittest.TestCase):
         
         shutil.rmtree(test_dir)
 
+    def test_split_hash_reproducibility(self):
+        from src.data.split_manager import get_or_create_split
+        import shutil
+        test_dir = "tests/test_splits_hash"
+        Path(test_dir).mkdir(exist_ok=True)
+        
+        # Test exact deterministic hash calculation
+        t1, v1, h1 = get_or_create_split(split_dir=test_dir, seed=42)
+        # Expected hash based on the deterministic sorted-keys utf-8 JSON dump
+        # We can just verify it is identical across runs on the same numpy seed
+        shutil.rmtree(test_dir)
+        Path(test_dir).mkdir(exist_ok=True)
+        t2, v2, h2 = get_or_create_split(split_dir=test_dir, seed=42)
+        
+        self.assertEqual(h1, h2)
+        
+        shutil.rmtree(test_dir)
+
 class TestPredictionSchema(unittest.TestCase):
     def test_clean_predictions(self):
         from src.evaluation.clean_eval import evaluate_clean

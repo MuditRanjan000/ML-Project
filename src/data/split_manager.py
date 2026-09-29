@@ -25,9 +25,12 @@ def get_or_create_split(split_dir: str = "splits", seed: int = 42) -> tuple[list
     train_indices = indices[:45000].tolist()
     val_indices = indices[45000:].tolist()
     
-    # Compute hash
-    hash_input = json.dumps({"train": train_indices, "val": val_indices}, sort_keys=True)
-    split_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+    # Compute deterministic hash
+    hash_input = json.dumps({
+        "train_indices": train_indices,
+        "val_indices": val_indices
+    }, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    split_hash = hashlib.sha256(hash_input).hexdigest()
     
     data = {
         "train_indices": train_indices,
