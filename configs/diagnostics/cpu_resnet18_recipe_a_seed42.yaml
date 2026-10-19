@@ -1,0 +1,24 @@
+# Diagnostic-only override: never use this configuration for the frozen 12-run study.
+experiment:
+  seed: 42
+  output_dir: "results/diagnostics"
+  model_name: "resnet18"
+  recipe: "recipe_a"
+
+data:
+  num_workers: 0
+  pin_memory: false
+
+training:
+  epochs: 2
+  batch_size: 32
+  use_amp: false
+
+evaluation:
+  results_root: "results/diagnostics"
+
+diagnostic:
+  run_id: "cpu_resnet18_recipe_a_seed42"
+  train_subset_size: 512
+  validation_subset_size: 128
+  clean_test_subset_size: 128

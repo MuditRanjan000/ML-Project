@@ -1,3 +1,5 @@
+"""Legacy scalar helpers retained for tests; canonical metrics live in evaluation.contract."""
+
 import torch
 
 def calculate_top1_metrics(correct_predictions: int, total_samples: int) -> dict:
