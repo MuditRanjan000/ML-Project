@@ -1,3 +1,5 @@
+"""Legacy unit-test helper; production evaluation uses evaluation.contract.calibration."""
+
 import torch
 import torch.nn.functional as F
 

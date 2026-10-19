@@ -48,10 +48,10 @@ def main():
         raise ValueError(f"Unknown architecture: {model_name}")
         
     evaluator = Evaluator(model, config, device)
-    summary = evaluator.run_full_evaluation(run_id)
+    summary = evaluator.run_contract_evaluation(run_id)
     
     print("\nEvaluation Summary:")
-    print(json.dumps(summary["metrics"], indent=4))
+    print(summary[0].to_json(orient="records", indent=2))
 
 if __name__ == "__main__":
     main()

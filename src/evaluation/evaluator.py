@@ -1,15 +1,14 @@
 import torch
 from pathlib import Path
 import json
-import pandas as pd
+import numpy as np
 from typing import Dict, Any
 
-from src.evaluation.clean_eval import evaluate_clean
-from src.evaluation.corruption_eval import evaluate_corruptions
-from src.evaluation.metrics import mean_corrupted_error, absolute_error_increase
 from src.calibration.temperature_scaling import fit_temperature_scaling
 from src.data.cifar100 import get_cifar100_dataloaders
 from src.data.transforms import get_transforms
+from src.data.cifar100_c import get_cifar100c_dataloader
+from src.evaluation.contract import CORRUPTIONS, SEVERITIES, PredictionStore, ResultAccumulator, RunMetadata, load_records, write_tables
 
 class Evaluator:
     """
@@ -20,107 +19,80 @@ class Evaluator:
         self.config = config
         self.device = device
         
-        self.results_dir = Path("results")
+        self.results_dir = Path(self.config.get("evaluation", {}).get("results_root", "results"))
         self.results_dir.mkdir(exist_ok=True)
         (self.results_dir / "runs").mkdir(exist_ok=True)
         (self.results_dir / "corruption_cells").mkdir(exist_ok=True)
         (self.results_dir / "reliability_bins").mkdir(exist_ok=True)
         
     def run_full_evaluation(self, run_id: str):
-        """
-        Executes calibration, clean evaluation, and robustness evaluation.
-        Loads validation-selected best checkpoint.
-        """
-        # Load best model metadata
+        """Backward-compatible entry point for the canonical contract evaluator."""
+        return self.run_contract_evaluation(run_id)
+
+    def run_contract_evaluation(self, run_id: str):
+        """Run the frozen evaluator with disk-backed records and canonical tables."""
         ckpt_dir = Path(self.config.get("experiment", {}).get("output_dir", "results")) / run_id / "checkpoints"
-        best_model_path = ckpt_dir / "best_model.pt"
-        metadata_path = ckpt_dir / "best_metadata.json"
-        
-        selected_epoch = -1
-        best_val_acc = -1.0
-        
-        if best_model_path.exists():
-            state = torch.load(best_model_path, map_location="cpu")
-            self.model.load_state_dict(state["model_state"])
-            
-        if metadata_path.exists():
-            with open(metadata_path, "r") as f:
-                ckpt_meta = json.load(f)
-                selected_epoch = ckpt_meta.get("best_epoch", -1)
-                best_val_acc = ckpt_meta.get("best_validation_accuracy", -1.0)
-        
+        best_path, metadata_path = ckpt_dir / "best_model.pt", ckpt_dir / "best_metadata.json"
+        if not best_path.is_file() or not metadata_path.is_file():
+            raise FileNotFoundError("best_model.pt and best_metadata.json are both required.")
+        state = torch.load(best_path, map_location="cpu")
+        self.model.load_state_dict(state["model_state"])
+        best = json.loads(metadata_path.read_text(encoding="utf-8"))
+        best_percent = float(best["best_validation_accuracy"])
+        if not 0.0 <= best_percent <= 100.0:
+            raise ValueError("Trainer best_validation_accuracy must be a percentage in [0, 100].")
         eval_transform = get_transforms(self.config, is_training=False)
-        _, val_loader, test_loader = get_cifar100_dataloaders(self.config, None, eval_transform)
-        
-        # Tracking hashes
-        import hashlib
+        _, validation_loader, test_loader = get_cifar100_dataloaders(self.config, None, eval_transform)
         from src.data.split_manager import get_or_create_split
-        _, _, split_hash = get_or_create_split(seed=self.config.get("experiment", {}).get("seed", 42))
-        preproc_hash = hashlib.sha256(repr(eval_transform).encode()).hexdigest()
-        
-        # 1. Fit Temperature on Clean Validation Set ONLY
-        opt_temp = fit_temperature_scaling(self.model, val_loader, self.device)
-        
-        # 2. Evaluate Clean Test Set
-        num_ece_bins = self.config.get("evaluation", {}).get("ece_bins", 15)
-        clean_res_raw = evaluate_clean(self.model, test_loader, self.device, temperature=1.0, num_ece_bins=num_ece_bins)
-        clean_res_scaled = evaluate_clean(self.model, test_loader, self.device, temperature=opt_temp, num_ece_bins=num_ece_bins)
-        
-        # 3. Evaluate CIFAR-100-C
-        df_corrupt, predictions = evaluate_corruptions(self.model, self.config, self.device, run_id)
-        
-        # 4. Calculate Aggregate Metrics
-        mce = mean_corrupted_error(df_corrupt["error_fraction"].tolist())
-        aei = absolute_error_increase(mce, clean_res_raw["clean_top1_error"])
-        
-        # 5. Build Summary
-        summary = {
-            "run_id": run_id,
-            "metadata": {
-                "model_name": self.config.get("experiment", {}).get("model_name", "unknown"),
-                "recipe": self.config.get("experiment", {}).get("recipe", "unknown"),
-                "seed": self.config.get("experiment", {}).get("seed", 42),
-                "checkpoint_identifier": "best_model.pt",
-                "selected_epoch": selected_epoch,
-                "best_validation_accuracy": best_val_acc,
-                "split_hash": split_hash,
-                "preprocessing_config_identifier": preproc_hash
-            },
-            "metrics": {
-                "Clean Top-1 Acc": clean_res_raw["clean_top1_acc"],
-                "Mean Corrupted Error": mce,
-                "Absolute Error Increase (AEI)": aei,
-                "Raw ECE": clean_res_raw["ece"],
-                "Temp-Scaled ECE": clean_res_scaled["ece"],
-                "Optimal Temperature": opt_temp
-            }
-        }
-        
-        # 6. Save Outputs
-        # Save JSON
-        with open(self.results_dir / "runs" / f"{run_id}.json", "w") as f:
-            json.dump(summary, f, indent=4)
-            
-        # Save CSV summary
-        df_summary = pd.json_normalize(summary)
-        df_summary.to_csv(self.results_dir / "runs" / f"{run_id}.csv", index=False)
-        
-        # Save Corruption Cells
-        df_corrupt.to_csv(self.results_dir / "corruption_cells" / f"{run_id}.csv", index=False)
-        
-        # Save Predictions if enabled
-        if self.config.get("evaluation", {}).get("save_predictions", False):
-            pred_dir = self.results_dir / "predictions" / run_id
-            pred_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save clean predictions
-            torch.save({
-                "logits": clean_res_raw["logits"],
-                "targets": clean_res_raw["targets"]
-            }, pred_dir / "clean_predictions.pt")
-            
-            # Save corruption predictions
-            for corr_sev, preds in predictions.items():
-                torch.save(preds, pred_dir / f"{corr_sev}_predictions.pt")
-        
-        return summary
+        _, _, split_hash = get_or_create_split()
+        import hashlib
+        metadata = RunMetadata(
+            run_id=run_id,
+            architecture=self.config.get("experiment", {}).get("model_name", "unknown"),
+            recipe=self.config.get("experiment", {}).get("recipe", "unknown"),
+            training_seed=int(self.config.get("experiment", {}).get("seed", 42)),
+            checkpoint_id=best["checkpoint_identifier"],
+            selected_epoch=int(best["best_epoch"]),
+            best_validation_accuracy_fraction=self.validation_accuracy_fraction(best_percent),
+            split_hash=split_hash,
+            evaluation_preprocessing_config_id=hashlib.sha256(repr(eval_transform).encode()).hexdigest(),
+        )
+        temperature = fit_temperature_scaling(self.model, validation_loader, self.device)
+        raw_root = self.results_dir / "predictions"
+        accumulator = ResultAccumulator(metadata, temperature)
+        self.model.eval()
+        with torch.no_grad():
+            with PredictionStore.create(raw_root, metadata, record_type="clean_cifar100", expected_samples=10_000, num_classes=100, temperature=temperature) as clean_store:
+                offset = 0
+                for inputs, labels in test_loader:
+                    logits = self.model(inputs.to(self.device)).cpu().numpy()
+                    targets = labels.numpy()
+                    clean_store.append(np.arange(offset, offset + targets.size), logits, targets)
+                    offset += targets.size
+                clean_directory = clean_store.finalize()
+            _, clean = load_records(clean_directory)
+            accumulator.add_clean(clean["logits"], clean["labels"])
+            del clean
+            for corruption in CORRUPTIONS:
+                for severity in SEVERITIES:
+                    with PredictionStore.create(raw_root, metadata, record_type="cifar100c", corruption=corruption, severity=severity, expected_samples=10_000, num_classes=100, temperature=temperature) as store:
+                        offset = 0
+                        for inputs, labels in get_cifar100c_dataloader(self.config, corruption, severity, eval_transform):
+                            logits = self.model(inputs.to(self.device)).cpu().numpy()
+                            targets = labels.numpy()
+                            store.append(np.arange(offset, offset + targets.size), logits, targets)
+                            offset += targets.size
+                        cell_directory = store.finalize()
+                    _, cell = load_records(cell_directory)
+                    accumulator.add_cell(corruption, severity, cell["logits"], cell["labels"])
+                    del cell
+        tables = accumulator.finalize()
+        write_tables(self.results_dir, metadata, tables)
+        return tables
+
+    @staticmethod
+    def validation_accuracy_fraction(best_validation_accuracy_percent: float) -> float:
+        """Convert trainer's percentage field to a fraction exactly once."""
+        if not 0.0 <= best_validation_accuracy_percent <= 100.0:
+            raise ValueError("Trainer best_validation_accuracy must be a percentage in [0, 100].")
+        return best_validation_accuracy_percent / 100.0
