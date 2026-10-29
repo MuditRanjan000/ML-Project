@@ -19,7 +19,7 @@ class AMPManager:
             # Fallback for CPU or disabled AMP
             import contextlib
             return contextlib.nullcontext()
-            
+
     def scale_loss(self, loss):
         """Scales the loss if GradScaler is active."""
         if self.scaler is not None:
@@ -33,3 +33,14 @@ class AMPManager:
             self.scaler.update()
         else:
             optimizer.step()
+
+    def state_dict(self):
+        """Returns scaler state dict if active, otherwise None."""
+        if self.scaler is not None:
+            return self.scaler.state_dict()
+        return None
+
+    def load_state_dict(self, state_dict):
+        """Restores scaler state dict if provided and scaler is active."""
+        if self.scaler is not None and state_dict is not None:
+            self.scaler.load_state_dict(state_dict)
