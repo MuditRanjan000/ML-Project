@@ -147,6 +147,7 @@ class CheckpointManager:
                 "schema_version": schema_version,
                 "config_hash": latest_ckpt.get("config_hash"),
                 "evaluation_preprocessing_id": latest_ckpt.get("evaluation_preprocessing_id"),
+                "evaluation_preprocessing_descriptor_sha256": latest_ckpt.get("evaluation_preprocessing_descriptor_sha256"),
                 "split_hash": latest_ckpt.get("run_identity", {}).get("split_hash")
             }
             if latest_ckpt.get("best_metadata"):
@@ -198,6 +199,7 @@ class CheckpointManager:
                 "run_identity": latest_ckpt.get("run_identity"),
                 "config_hash": latest_ckpt.get("config_hash"),
                 "evaluation_preprocessing_id": latest_ckpt.get("evaluation_preprocessing_id"),
+                "evaluation_preprocessing_descriptor_sha256": latest_ckpt.get("evaluation_preprocessing_descriptor_sha256"),
             }
             cls._atomic_torch_save(best_state, best_pt)
 
@@ -208,6 +210,7 @@ class CheckpointManager:
                 "schema_version": schema_version,
                 "config_hash": latest_ckpt.get("config_hash"),
                 "evaluation_preprocessing_id": latest_ckpt.get("evaluation_preprocessing_id"),
+                "evaluation_preprocessing_descriptor_sha256": latest_ckpt.get("evaluation_preprocessing_descriptor_sha256"),
                 "split_hash": latest_ckpt.get("run_identity", {}).get("split_hash")
             }
             if latest_ckpt.get("best_metadata"):
@@ -256,6 +259,7 @@ class CheckpointManager:
             "schema_version": state_dict.get("schema_version", "2.0"),
             "config_hash": state_dict.get("config_hash"),
             "evaluation_preprocessing_id": state_dict.get("evaluation_preprocessing_id"),
+            "evaluation_preprocessing_descriptor_sha256": state_dict.get("evaluation_preprocessing_descriptor_sha256"),
             "split_hash": state_dict.get("run_identity", {}).get("split_hash")
         }
         if extra_metadata:
@@ -284,6 +288,7 @@ class CheckpointManager:
             "schema_version": state_dict.get("schema_version", "2.0"),
             "config_hash": state_dict.get("config_hash"),
             "evaluation_preprocessing_id": state_dict.get("evaluation_preprocessing_id"),
+            "evaluation_preprocessing_descriptor_sha256": state_dict.get("evaluation_preprocessing_descriptor_sha256"),
             "split_hash": state_dict.get("run_identity", {}).get("split_hash")
         }
         if extra_metadata:
@@ -304,6 +309,7 @@ class CheckpointManager:
                 "run_identity": state_dict.get("run_identity"),
                 "config_hash": state_dict.get("config_hash"),
                 "evaluation_preprocessing_id": state_dict.get("evaluation_preprocessing_id"),
+                "evaluation_preprocessing_descriptor_sha256": state_dict.get("evaluation_preprocessing_descriptor_sha256"),
             }
             self._atomic_torch_save(best_state, best_filename)
             self._atomic_json_save(best_metadata, self.checkpoint_dir / "best_metadata.json")

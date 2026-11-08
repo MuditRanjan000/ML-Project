@@ -11,7 +11,12 @@ from src.evaluation.contract import CORRUPTIONS, SEVERITIES, PredictionStore, Re
 
 class ContractEvaluationTests(unittest.TestCase):
     def setUp(self):
-        self.metadata = RunMetadata("synthetic_A_42", "resnet18", "A", 42, "best_model.pt", 4, 0.75, "37a0b25b0d19c41318705a236055a7f375d9729dc51b8aa5d2b070f7716c9f91", "dc9cb66d30e90972331e408340d0f00d8006e829665c79ddc254c7bb853f0862")
+        self.metadata = RunMetadata(
+            "synthetic_A_42", "resnet18", "A", 42, "best_model.pt", 4, 0.75,
+            "37a0b25b0d19c41318705a236055a7f375d9729dc51b8aa5d2b070f7716c9f91",
+            "5256477cf00b8bcaec855fb96067bcbe6e718235b083b92261dd407b501f989e",
+            "dc9cb66d30e90972331e408340d0f00d8006e829665c79ddc254c7bb853f0862"
+        )
 
     def test_all_75_cells_reproduce_pooled_ece_from_saved_records(self):
         clean_logits = np.array([[3., 0.], [0., 3.], [1., 0.]], dtype=np.float32)

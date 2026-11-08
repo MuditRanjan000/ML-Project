@@ -6,7 +6,14 @@ from typing import Dict, Any
 
 from src.calibration.temperature_scaling import fit_temperature_scaling
 from src.data.cifar100 import get_cifar100_dataloaders
-from src.data.transforms import get_transforms, get_evaluation_preprocessing_id
+from src.data.transforms import (
+    get_transforms,
+    get_evaluation_preprocessing_id,
+    get_evaluation_preprocessing_descriptor_sha256,
+    validate_evaluation_preprocessing,
+    FROZEN_EVALUATION_PREPROCESSING_ID,
+    EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256
+)
 from src.data.cifar100_c import get_cifar100c_dataloader
 from src.evaluation.contract import CORRUPTIONS, SEVERITIES, PredictionStore, ResultAccumulator, RunMetadata, load_records, write_tables
 from src.training.checkpointing import CheckpointManager
@@ -43,13 +50,11 @@ class Evaluator:
         state = torch.load(best_path, map_location="cpu")
 
         # Validate evaluation preprocessing identity against active frozen configuration
-        expected_eval_id = get_evaluation_preprocessing_id(self.config)
-        saved_eval_id = state.get("evaluation_preprocessing_id")
-        if saved_eval_id is not None and saved_eval_id != expected_eval_id:
-            raise ValueError(
-                f"Evaluation preprocessing mismatch: checkpoint evaluation_preprocessing_id='{saved_eval_id}' "
-                f"does not match active config '{expected_eval_id}'."
-            )
+        validate_evaluation_preprocessing(
+            config=self.config,
+            evaluation_preprocessing_id=state.get("evaluation_preprocessing_id"),
+            evaluation_preprocessing_descriptor_sha256=state.get("evaluation_preprocessing_descriptor_sha256")
+        )
 
         self.model.load_state_dict(state["model_state"])
         best = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -70,7 +75,8 @@ class Evaluator:
             selected_epoch=int(best["best_epoch"]),
             best_validation_accuracy_fraction=self.validation_accuracy_fraction(best_percent),
             split_hash=split_hash,
-            evaluation_preprocessing_config_id=expected_eval_id,
+            evaluation_preprocessing_config_id=FROZEN_EVALUATION_PREPROCESSING_ID,
+            evaluation_preprocessing_descriptor_sha256=EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256,
         )
         temperature = fit_temperature_scaling(self.model, validation_loader, self.device)
         raw_root = self.results_dir / "predictions"

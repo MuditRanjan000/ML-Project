@@ -30,6 +30,7 @@ class RunMetadata:
     best_validation_accuracy_fraction: float
     split_hash: str
     evaluation_preprocessing_config_id: str
+    evaluation_preprocessing_descriptor_sha256: str = "dc9cb66d30e90972331e408340d0f00d8006e829665c79ddc254c7bb853f0862"
 
 
 def softmax(logits: np.ndarray) -> np.ndarray:

@@ -352,9 +352,10 @@ def run_cuda_amp_scaler_diagnostic(device, diag_root):
     assert non_default_growth_tracker == 2
 
     # 4. Save checkpoint containing non-default scaler state
-    from src.data.transforms import get_evaluation_preprocessing_id
+    from src.data.transforms import get_evaluation_preprocessing_id, get_evaluation_preprocessing_descriptor_sha256
     run_id_dict = trainer1._get_run_identity()
     eval_id = get_evaluation_preprocessing_id(cfg)
+    eval_sha256 = get_evaluation_preprocessing_descriptor_sha256(cfg)
     state_dict = {
         'epoch': 1,
         'model_state': model1.state_dict(),
@@ -369,6 +370,7 @@ def run_cuda_amp_scaler_diagnostic(device, diag_root):
         'run_identity': run_id_dict,
         'config_hash': run_id_dict["config_hash"],
         'evaluation_preprocessing_id': eval_id,
+        'evaluation_preprocessing_descriptor_sha256': eval_sha256,
         'schema_version': "2.0",
         'checkpoint_type': "latest"
     }
@@ -487,12 +489,15 @@ def main():
     # Execute Part 2: CUDA AMP scaler restoration test
     amp_report = run_cuda_amp_scaler_diagnostic(device, diag_root)
 
+    from src.data.transforms import get_evaluation_preprocessing_id, get_evaluation_preprocessing_descriptor_sha256
     report = {
         "gpu_device": gpu_name,
         "cuda_version": cuda_ver,
         "model": "ResNet-18 (CIFAR modified)",
         "recipe": "recipe_a",
         "dataset": "CIFAR-100",
+        "frozen_evaluation_preprocessing_id": get_evaluation_preprocessing_id(),
+        "evaluation_preprocessing_descriptor_sha256": get_evaluation_preprocessing_descriptor_sha256(),
         "part_1_production_worker_continuation": workers_report,
         "part_2_cuda_amp_scaler_restoration": amp_report
     }

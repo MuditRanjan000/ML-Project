@@ -15,7 +15,13 @@ from src.training.checkpointing import CheckpointManager
 from src.training.amp import AMPManager
 from src.training.optimizer import get_optimizer
 from src.training.scheduler import get_scheduler
-from src.data.transforms import get_evaluation_preprocessing_id
+from src.data.transforms import (
+    get_evaluation_preprocessing_id,
+    get_evaluation_preprocessing_descriptor_sha256,
+    validate_evaluation_preprocessing,
+    FROZEN_EVALUATION_PREPROCESSING_ID,
+    EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256
+)
 from src.evaluation.evaluator import Evaluator
 
 class SmallTestModel(nn.Module):
@@ -202,6 +208,7 @@ class TestTrainingResumption(unittest.TestCase):
             "run_identity": run_id_dict,
             "config_hash": run_id_dict["config_hash"],
             "evaluation_preprocessing_id": run_id_dict["evaluation_preprocessing_id"],
+            "evaluation_preprocessing_descriptor_sha256": run_id_dict["evaluation_preprocessing_descriptor_sha256"],
             "schema_version": "2.0",
             "checkpoint_type": "latest"
         }
@@ -549,6 +556,7 @@ class TestTrainingResumption(unittest.TestCase):
             'run_identity': run_id_dict,
             'config_hash': run_id_dict["config_hash"],
             'evaluation_preprocessing_id': run_id_dict["evaluation_preprocessing_id"],
+            'evaluation_preprocessing_descriptor_sha256': run_id_dict["evaluation_preprocessing_descriptor_sha256"],
             'schema_version': "2.0",
             'checkpoint_type': "latest"
         }
@@ -638,6 +646,7 @@ class TestTrainingResumption(unittest.TestCase):
             "run_identity",
             "config_hash",
             "evaluation_preprocessing_id",
+            "evaluation_preprocessing_descriptor_sha256",
             "checkpoint_type",
             "schema_version",
             "metrics"
@@ -673,7 +682,7 @@ class TestTrainingResumption(unittest.TestCase):
         trainer_mismatch = self._build_trainer(config=cfg_bad_eval)
         with self.assertRaises(ValueError) as ctx:
             trainer_mismatch.resume_from_checkpoint(latest_path)
-        self.assertIn("Evaluation preprocessing mismatch", str(ctx.exception))
+        self.assertIn("Evaluation preprocessing", str(ctx.exception))
 
     # 18. CUDA AMP scaler state restoration step test
     def test_18_cuda_amp_scaler_restoration_step(self):
@@ -742,6 +751,7 @@ class TestTrainingResumption(unittest.TestCase):
         train_loader, val_loader = create_synthetic_dataloaders()
         run_id_dict = trainer1._get_run_identity()
         eval_id = get_evaluation_preprocessing_id(cfg)
+        eval_desc_sha256 = get_evaluation_preprocessing_descriptor_sha256(cfg)
         state_dict = {
             'epoch': 1,
             'model_state': trainer1.model.state_dict(),
@@ -756,6 +766,7 @@ class TestTrainingResumption(unittest.TestCase):
             'run_identity': run_id_dict,
             'config_hash': run_id_dict["config_hash"],
             'evaluation_preprocessing_id': eval_id,
+            'evaluation_preprocessing_descriptor_sha256': eval_desc_sha256,
             'schema_version': "2.0",
             'checkpoint_type': "latest"
         }

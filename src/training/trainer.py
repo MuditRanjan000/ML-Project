@@ -11,7 +11,13 @@ import torch.nn as nn
 
 from src.training.checkpointing import CheckpointManager
 from src.training.amp import AMPManager
-from src.data.transforms import get_evaluation_preprocessing_id
+from src.data.transforms import (
+    get_evaluation_preprocessing_id,
+    get_evaluation_preprocessing_descriptor_sha256,
+    validate_evaluation_preprocessing,
+    FROZEN_EVALUATION_PREPROCESSING_ID,
+    EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256
+)
 
 def compute_config_hash(config: Dict[str, Any], split_hash: Optional[str] = None) -> str:
     """
@@ -116,6 +122,7 @@ class Trainer:
 
         config_hash = compute_config_hash(self.config, split_hash)
         eval_preprocessing_id = get_evaluation_preprocessing_id(self.config)
+        eval_descriptor_sha256 = get_evaluation_preprocessing_descriptor_sha256(self.config)
 
         return {
             "schema_version": "2.0",
@@ -130,6 +137,7 @@ class Trainer:
             "split_hash": split_hash,
             "config_hash": config_hash,
             "evaluation_preprocessing_id": eval_preprocessing_id,
+            "evaluation_preprocessing_descriptor_sha256": eval_descriptor_sha256,
             "optimizer": {
                 "name": str(self.config.get("optimizer", {}).get("name", "sgd")).lower(),
                 "lr": float(self.config.get("optimizer", {}).get("lr", 0.1)),
@@ -244,6 +252,7 @@ class Trainer:
             "run_identity",
             "config_hash",
             "evaluation_preprocessing_id",
+            "evaluation_preprocessing_descriptor_sha256",
             "checkpoint_type",
             "schema_version",
             "metrics"
@@ -314,7 +323,7 @@ class Trainer:
         required_id_keys = [
             "run_id", "architecture", "recipe", "seed", "total_epochs",
             "batch_size", "num_workers", "persistent_workers", "split_hash",
-            "config_hash", "evaluation_preprocessing_id"
+            "config_hash", "evaluation_preprocessing_id", "evaluation_preprocessing_descriptor_sha256"
         ]
         for id_key in required_id_keys:
             if id_key not in saved_id or saved_id[id_key] is None:
@@ -325,6 +334,9 @@ class Trainer:
 
         if not isinstance(checkpoint["evaluation_preprocessing_id"], str) or len(checkpoint["evaluation_preprocessing_id"]) == 0:
             raise ValueError(f"Invalid 'evaluation_preprocessing_id' in checkpoint.")
+
+        if not isinstance(checkpoint["evaluation_preprocessing_descriptor_sha256"], str) or len(checkpoint["evaluation_preprocessing_descriptor_sha256"]) == 0:
+            raise ValueError(f"Invalid 'evaluation_preprocessing_descriptor_sha256' in checkpoint.")
 
         # 2. Runtime Configuration Compatibility Checks
         current_id = self._get_run_identity()
@@ -381,13 +393,14 @@ class Trainer:
                     f"Augmentation setting mismatch for '{aug_key}': checkpoint has {aug_key}='{s_val}', but current config has {aug_key}='{c_val}'."
                 )
 
-        # 6. Evaluation Preprocessing Identity Check
+        # 6. Evaluation Preprocessing Identity and Descriptor Fingerprint Checks
         saved_eval_id = checkpoint.get("evaluation_preprocessing_id") or saved_id.get("evaluation_preprocessing_id")
-        curr_eval_id = current_id.get("evaluation_preprocessing_id")
-        if saved_eval_id is not None and curr_eval_id is not None and saved_eval_id != curr_eval_id:
-            raise ValueError(
-                f"Evaluation preprocessing mismatch: checkpoint has evaluation_preprocessing_id='{saved_eval_id}', but current config has '{curr_eval_id}'."
-            )
+        saved_eval_sha256 = checkpoint.get("evaluation_preprocessing_descriptor_sha256") or saved_id.get("evaluation_preprocessing_descriptor_sha256")
+        validate_evaluation_preprocessing(
+            config=self.config,
+            evaluation_preprocessing_id=saved_eval_id,
+            evaluation_preprocessing_descriptor_sha256=saved_eval_sha256
+        )
 
         # 7. Canonical Config Hash Check
         saved_hash = saved_id.get("config_hash") or checkpoint.get("config_hash")
@@ -573,6 +586,7 @@ class Trainer:
             run_id_dict = self._get_run_identity()
             rng_state = self._capture_rng_state(train_loader)
             eval_preprocessing_id = get_evaluation_preprocessing_id(self.config)
+            eval_descriptor_sha256 = get_evaluation_preprocessing_descriptor_sha256(self.config)
             state_dict = {
                 'epoch': epoch,
                 'model_state': self.model.state_dict(),
@@ -587,6 +601,7 @@ class Trainer:
                 'run_identity': run_id_dict,
                 'config_hash': run_id_dict.get("config_hash"),
                 'evaluation_preprocessing_id': eval_preprocessing_id,
+                'evaluation_preprocessing_descriptor_sha256': eval_descriptor_sha256,
                 'schema_version': "2.0",
                 'checkpoint_type': "latest"
             }
@@ -598,6 +613,7 @@ class Trainer:
                 "split_hash": run_id_dict["split_hash"],
                 "config_hash": run_id_dict.get("config_hash"),
                 "evaluation_preprocessing_id": eval_preprocessing_id,
+                "evaluation_preprocessing_descriptor_sha256": eval_descriptor_sha256,
                 "latest_training_state": "completed" if is_final_epoch else "running"
             }
             self.ckpt_manager.save_checkpoint(
