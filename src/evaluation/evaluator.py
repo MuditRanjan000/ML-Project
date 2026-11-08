@@ -6,9 +6,10 @@ from typing import Dict, Any
 
 from src.calibration.temperature_scaling import fit_temperature_scaling
 from src.data.cifar100 import get_cifar100_dataloaders
-from src.data.transforms import get_transforms
+from src.data.transforms import get_transforms, get_evaluation_preprocessing_id
 from src.data.cifar100_c import get_cifar100c_dataloader
 from src.evaluation.contract import CORRUPTIONS, SEVERITIES, PredictionStore, ResultAccumulator, RunMetadata, load_records, write_tables
+from src.training.checkpointing import CheckpointManager
 
 class Evaluator:
     """
@@ -18,13 +19,13 @@ class Evaluator:
         self.model = model.to(device)
         self.config = config
         self.device = device
-        
+
         self.results_dir = Path(self.config.get("evaluation", {}).get("results_root", "results"))
         self.results_dir.mkdir(exist_ok=True)
         (self.results_dir / "runs").mkdir(exist_ok=True)
         (self.results_dir / "corruption_cells").mkdir(exist_ok=True)
         (self.results_dir / "reliability_bins").mkdir(exist_ok=True)
-        
+
     def run_full_evaluation(self, run_id: str):
         """Backward-compatible entry point for the canonical contract evaluator."""
         return self.run_contract_evaluation(run_id)
@@ -32,10 +33,24 @@ class Evaluator:
     def run_contract_evaluation(self, run_id: str):
         """Run the frozen evaluator with disk-backed records and canonical tables."""
         ckpt_dir = Path(self.config.get("experiment", {}).get("output_dir", "results")) / run_id / "checkpoints"
+
+        # 1. Reconcile stale or missing best checkpoint artifacts from authoritative latest checkpoint
+        CheckpointManager.reconcile_checkpoints(ckpt_dir, self.config)
+
         best_path, metadata_path = ckpt_dir / "best_model.pt", ckpt_dir / "best_metadata.json"
         if not best_path.is_file() or not metadata_path.is_file():
             raise FileNotFoundError("best_model.pt and best_metadata.json are both required.")
         state = torch.load(best_path, map_location="cpu")
+
+        # Validate evaluation preprocessing identity against active frozen configuration
+        expected_eval_id = get_evaluation_preprocessing_id(self.config)
+        saved_eval_id = state.get("evaluation_preprocessing_id")
+        if saved_eval_id is not None and saved_eval_id != expected_eval_id:
+            raise ValueError(
+                f"Evaluation preprocessing mismatch: checkpoint evaluation_preprocessing_id='{saved_eval_id}' "
+                f"does not match active config '{expected_eval_id}'."
+            )
+
         self.model.load_state_dict(state["model_state"])
         best = json.loads(metadata_path.read_text(encoding="utf-8"))
         best_percent = float(best["best_validation_accuracy"])
@@ -45,7 +60,7 @@ class Evaluator:
         _, validation_loader, test_loader = get_cifar100_dataloaders(self.config, None, eval_transform)
         from src.data.split_manager import get_or_create_split
         _, _, split_hash = get_or_create_split()
-        import hashlib
+
         metadata = RunMetadata(
             run_id=run_id,
             architecture=self.config.get("experiment", {}).get("model_name", "unknown"),
@@ -55,7 +70,7 @@ class Evaluator:
             selected_epoch=int(best["best_epoch"]),
             best_validation_accuracy_fraction=self.validation_accuracy_fraction(best_percent),
             split_hash=split_hash,
-            evaluation_preprocessing_config_id=hashlib.sha256(repr(eval_transform).encode()).hexdigest(),
+            evaluation_preprocessing_config_id=expected_eval_id,
         )
         temperature = fit_temperature_scaling(self.model, validation_loader, self.device)
         raw_root = self.results_dir / "predictions"

@@ -1,5 +1,43 @@
+import json
+import hashlib
 from torchvision import transforms
-from typing import Callable, Dict, Any
+from typing import Callable, Dict, Any, Optional
+
+def get_evaluation_preprocessing_descriptor(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Returns the canonical evaluation preprocessing configuration descriptor.
+    Binds dataset, image dimensions, normalization constants, and transforms order.
+    """
+    if config is None:
+        data_config = {}
+    else:
+        data_config = config.get("data", {})
+
+    img_size = int(data_config.get("image_size", 32))
+    dataset = str(data_config.get("dataset", "CIFAR-100"))
+    mean = [0.5071, 0.4867, 0.4408]
+    std = [0.2675, 0.2565, 0.2761]
+
+    return {
+        "dataset": dataset,
+        "image_size": img_size,
+        "normalization": {
+            "mean": mean,
+            "std": std
+        },
+        "transforms": [
+            {"type": "ToTensor"},
+            {"type": "Normalize", "mean": mean, "std": std}
+        ]
+    }
+
+def get_evaluation_preprocessing_id(config: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Computes a deterministic canonical SHA-256 hash of the evaluation preprocessing descriptor.
+    """
+    desc = get_evaluation_preprocessing_descriptor(config)
+    encoded = json.dumps(desc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 def get_transforms(config: Dict[str, Any], is_training: bool = False) -> Callable:
     """

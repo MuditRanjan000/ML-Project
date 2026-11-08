@@ -11,11 +11,12 @@ import torch.nn as nn
 
 from src.training.checkpointing import CheckpointManager
 from src.training.amp import AMPManager
+from src.data.transforms import get_evaluation_preprocessing_id
 
 def compute_config_hash(config: Dict[str, Any], split_hash: Optional[str] = None) -> str:
     """
     Computes a deterministic canonical SHA-256 hash of all experimental settings.
-    Normalizes non-experimental fields (such as local filesystem paths or hardware worker counts).
+    Normalizes non-experimental fields (such as local filesystem paths or hardware flags).
     """
     normalized = {
         "model": config.get("model", {}),
@@ -78,6 +79,7 @@ class Trainer:
         self.start_epoch = 1
         self.best_metric = -float('inf')
         self.best_epoch = 0
+        self.best_model_state = None
         self._saved_rng_state = None
 
         # AMP
@@ -113,9 +115,10 @@ class Trainer:
                 split_hash = FROZEN_SPLIT_HASH
 
         config_hash = compute_config_hash(self.config, split_hash)
+        eval_preprocessing_id = get_evaluation_preprocessing_id(self.config)
 
         return {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "run_id": run_id,
             "architecture": model_name,
             "recipe": recipe,
@@ -126,6 +129,7 @@ class Trainer:
             "persistent_workers": persistent_workers,
             "split_hash": split_hash,
             "config_hash": config_hash,
+            "evaluation_preprocessing_id": eval_preprocessing_id,
             "optimizer": {
                 "name": str(self.config.get("optimizer", {}).get("name", "sgd")).lower(),
                 "lr": float(self.config.get("optimizer", {}).get("lr", 0.1)),
@@ -203,31 +207,127 @@ class Trainer:
                 dataloader.generator.set_state(gen_state)
 
     def _validate_checkpoint(self, checkpoint: Dict[str, Any], checkpoint_path: Path) -> None:
-        """Validates checkpoint payload and asserts strict run identity compatibility."""
+        """Validates checkpoint payload, required schema fields, and asserts strict run identity compatibility."""
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Corrupt checkpoint at {checkpoint_path}: payload is not a dictionary.")
+
+        # Rejection of resuming from best_model.pt
         if checkpoint_path.name == "best_model.pt" or checkpoint.get("checkpoint_type") == "best":
             raise ValueError(
                 f"Cannot resume from '{checkpoint_path.name}'. Resumption must use 'latest_model.pt' to preserve exact training trajectory."
             )
 
-        if not isinstance(checkpoint, dict):
-            raise ValueError(f"Corrupt checkpoint at {checkpoint_path}: payload is not a dictionary.")
-
-        if "model_state" not in checkpoint:
-            raise ValueError(f"Invalid checkpoint at {checkpoint_path}: missing required key 'model_state'.")
-
-        if "epoch" not in checkpoint:
-            raise ValueError(f"Invalid checkpoint at {checkpoint_path}: missing required key 'epoch'.")
-
-        schema_version = checkpoint.get("schema_version")
-        if schema_version != "1.0":
+        if checkpoint.get("checkpoint_type") != "latest":
             raise ValueError(
-                f"Incompatible checkpoint schema version: found '{schema_version}', expected '1.0'."
+                f"Invalid checkpoint_type: found '{checkpoint.get('checkpoint_type')}', expected 'latest'."
             )
 
-        saved_id = checkpoint.get("run_identity", {})
-        current_id = self._get_run_identity()
+        # Enforce Schema Version 2.0
+        schema_version = checkpoint.get("schema_version")
+        if schema_version != "2.0":
+            raise ValueError(
+                f"Incompatible checkpoint schema version: found '{schema_version}', expected '2.0'."
+            )
 
-        # 1. Base identity checks
+        # 1. Complete Required Top-Level Fields Verification
+        required_fields = [
+            "epoch",
+            "model_state",
+            "optimizer_state",
+            "scheduler_state",
+            "scaler_state",
+            "rng_state",
+            "best_epoch",
+            "best_metric",
+            "best_model_state",
+            "best_metadata",
+            "run_identity",
+            "config_hash",
+            "evaluation_preprocessing_id",
+            "checkpoint_type",
+            "schema_version",
+            "metrics"
+        ]
+
+        for field in required_fields:
+            if field not in checkpoint:
+                raise ValueError(
+                    f"Invalid checkpoint at {checkpoint_path}: missing required field '{field}'."
+                )
+
+        # Validate types and non-empty structure of required fields
+        epoch = checkpoint["epoch"]
+        if not isinstance(epoch, int) or epoch < 1:
+            raise ValueError(f"Invalid 'epoch' in checkpoint: expected positive int, got {epoch!r}.")
+
+        model_state = checkpoint["model_state"]
+        if not isinstance(model_state, dict) or len(model_state) == 0:
+            raise ValueError(f"Invalid 'model_state' in checkpoint: must be non-empty dict.")
+
+        opt_state = checkpoint["optimizer_state"]
+        if not isinstance(opt_state, dict) or "param_groups" not in opt_state or "state" not in opt_state:
+            raise ValueError(f"Invalid 'optimizer_state' in checkpoint: must be dict with 'state' and 'param_groups'.")
+
+        sched_state = checkpoint["scheduler_state"]
+        if not isinstance(sched_state, dict) or len(sched_state) == 0:
+            raise ValueError(f"Invalid 'scheduler_state' in checkpoint: must be non-empty dict.")
+
+        scaler_state = checkpoint["scaler_state"]
+        if scaler_state is not None and not isinstance(scaler_state, dict):
+            raise ValueError(f"Invalid 'scaler_state' in checkpoint: must be dict or None.")
+
+        metrics = checkpoint["metrics"]
+        if not isinstance(metrics, dict) or "accuracy" not in metrics or "loss" not in metrics:
+            raise ValueError(f"Invalid 'metrics' in checkpoint: must be dict containing 'accuracy' and 'loss'.")
+
+        best_epoch = checkpoint["best_epoch"]
+        if not isinstance(best_epoch, int) or best_epoch < 1 or best_epoch > epoch:
+            raise ValueError(f"Invalid 'best_epoch' in checkpoint: {best_epoch!r} (current epoch: {epoch}).")
+
+        best_metric = checkpoint["best_metric"]
+        if not isinstance(best_metric, (int, float)):
+            raise ValueError(f"Invalid 'best_metric' in checkpoint: must be numeric, got {best_metric!r}.")
+
+        best_model_state = checkpoint["best_model_state"]
+        if not isinstance(best_model_state, dict) or len(best_model_state) == 0:
+            raise ValueError(f"Invalid 'best_model_state' snapshot in checkpoint: must be non-empty dict.")
+
+        best_metadata = checkpoint["best_metadata"]
+        if not isinstance(best_metadata, dict):
+            raise ValueError(f"Invalid 'best_metadata' in checkpoint: must be dict.")
+        for b_key in ["best_epoch", "best_validation_accuracy", "checkpoint_identifier"]:
+            if b_key not in best_metadata:
+                raise ValueError(f"Invalid 'best_metadata' in checkpoint: missing key '{b_key}'.")
+
+        rng_state = checkpoint["rng_state"]
+        if not isinstance(rng_state, dict):
+            raise ValueError(f"Invalid 'rng_state' in checkpoint: must be dict.")
+        for r_key in ["python", "numpy", "torch_cpu"]:
+            if r_key not in rng_state or rng_state[r_key] is None:
+                raise ValueError(f"Invalid 'rng_state' in checkpoint: missing required stream '{r_key}'.")
+        if torch.cuda.is_available() and ("torch_cuda" not in rng_state or rng_state["torch_cuda"] is None):
+            raise ValueError(f"Invalid 'rng_state' in checkpoint: CUDA is active but 'torch_cuda' RNG state is missing.")
+
+        saved_id = checkpoint["run_identity"]
+        if not isinstance(saved_id, dict):
+            raise ValueError(f"Invalid 'run_identity' in checkpoint: must be dict.")
+        required_id_keys = [
+            "run_id", "architecture", "recipe", "seed", "total_epochs",
+            "batch_size", "num_workers", "persistent_workers", "split_hash",
+            "config_hash", "evaluation_preprocessing_id"
+        ]
+        for id_key in required_id_keys:
+            if id_key not in saved_id or saved_id[id_key] is None:
+                raise ValueError(f"Invalid 'run_identity' in checkpoint: missing required field '{id_key}'.")
+
+        if not isinstance(checkpoint["config_hash"], str) or len(checkpoint["config_hash"]) == 0:
+            raise ValueError(f"Invalid 'config_hash' in checkpoint.")
+
+        if not isinstance(checkpoint["evaluation_preprocessing_id"], str) or len(checkpoint["evaluation_preprocessing_id"]) == 0:
+            raise ValueError(f"Invalid 'evaluation_preprocessing_id' in checkpoint.")
+
+        # 2. Runtime Configuration Compatibility Checks
+        current_id = self._get_run_identity()
         checks = [
             ("architecture", "Architecture mismatch"),
             ("recipe", "Recipe mismatch"),
@@ -248,7 +348,7 @@ class Trainer:
                     f"{err_msg}: checkpoint has {key}='{saved_val}', but current config has {key}='{curr_val}'."
                 )
 
-        # 2. Detailed Optimizer Hyperparameter Checks
+        # 3. Detailed Optimizer Hyperparameter Checks
         saved_opt = saved_id.get("optimizer", {})
         curr_opt = current_id.get("optimizer", {})
         for opt_key in ["name", "lr", "momentum", "weight_decay"]:
@@ -259,7 +359,7 @@ class Trainer:
                     f"Optimizer hyperparameter mismatch for '{opt_key}': checkpoint has {opt_key}='{s_val}', but current config has {opt_key}='{c_val}'."
                 )
 
-        # 3. Detailed Scheduler Parameter Checks
+        # 4. Detailed Scheduler Parameter Checks
         saved_sched = saved_id.get("scheduler", {})
         curr_sched = current_id.get("scheduler", {})
         for sched_key in ["name", "min_lr", "warmup_epochs", "step_size", "gamma"]:
@@ -270,7 +370,7 @@ class Trainer:
                     f"Scheduler parameter mismatch for '{sched_key}': checkpoint has {sched_key}='{s_val}', but current config has {sched_key}='{c_val}'."
                 )
 
-        # 4. Detailed Augmentation Setting Checks
+        # 5. Detailed Augmentation Setting Checks
         saved_aug = saved_id.get("augmentation", {})
         curr_aug = current_id.get("augmentation", {})
         for aug_key in ["type", "mixup_alpha", "cutmix_alpha", "rand_augment", "label_smoothing"]:
@@ -281,7 +381,15 @@ class Trainer:
                     f"Augmentation setting mismatch for '{aug_key}': checkpoint has {aug_key}='{s_val}', but current config has {aug_key}='{c_val}'."
                 )
 
-        # 5. Canonical Config Hash Check (covers all nested model parameters & settings)
+        # 6. Evaluation Preprocessing Identity Check
+        saved_eval_id = checkpoint.get("evaluation_preprocessing_id") or saved_id.get("evaluation_preprocessing_id")
+        curr_eval_id = current_id.get("evaluation_preprocessing_id")
+        if saved_eval_id is not None and curr_eval_id is not None and saved_eval_id != curr_eval_id:
+            raise ValueError(
+                f"Evaluation preprocessing mismatch: checkpoint has evaluation_preprocessing_id='{saved_eval_id}', but current config has '{curr_eval_id}'."
+            )
+
+        # 7. Canonical Config Hash Check
         saved_hash = saved_id.get("config_hash") or checkpoint.get("config_hash")
         curr_hash = current_id.get("config_hash")
         if saved_hash is not None and curr_hash is not None and saved_hash != curr_hash:
@@ -292,6 +400,7 @@ class Trainer:
     def resume_from_checkpoint(self, checkpoint_path: Union[str, Path]) -> bool:
         """
         Loads checkpoint state and prepares trainer to resume from the next epoch.
+        Reconciles any stale or missing best artifacts prior to state restoration.
         Returns True if training is already completed, False if resumption succeeded.
         """
         path = Path(checkpoint_path)
@@ -299,6 +408,9 @@ class Trainer:
             raise FileNotFoundError(
                 f"Checkpoint file not found: {path}. Resumption cannot start without a valid checkpoint."
             )
+
+        # Reconcile sidecar metadata and best artifacts prior to loading
+        self.ckpt_manager.reconcile_checkpoints(self.ckpt_manager.checkpoint_dir, self.config)
 
         try:
             checkpoint = torch.load(path, map_location=self.device)
@@ -332,7 +444,8 @@ class Trainer:
         # 5. Progress and Model Selection
         self.best_metric = float(checkpoint.get("best_metric", -float('inf')))
         self.best_epoch = int(checkpoint.get("best_epoch", 0))
-        self.ckpt_manager.set_best(self.best_epoch, self.best_metric)
+        self.best_model_state = checkpoint.get("best_model_state")
+        self.ckpt_manager.set_best(self.best_epoch, self.best_metric, self.best_model_state)
 
         # 6. Saved RNG state to be applied right at epoch boundary
         self._saved_rng_state = checkpoint.get("rng_state")
@@ -440,14 +553,26 @@ class Trainer:
                 f"Val Acc: {val_acc:.2f}%"
             )
 
-            # Update best tracking before building checkpoint payload
+            # Update best tracking and copy unmutated snapshot
             if val_acc > self.best_metric:
                 self.best_metric = val_acc
                 self.best_epoch = epoch
+                self.best_model_state = {
+                    k: v.clone().cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in self.model.state_dict().items()
+                }
+            elif self.best_model_state is None:
+                self.best_metric = val_acc
+                self.best_epoch = epoch
+                self.best_model_state = {
+                    k: v.clone().cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in self.model.state_dict().items()
+                }
 
             # Save checkpoint
             run_id_dict = self._get_run_identity()
             rng_state = self._capture_rng_state(train_loader)
+            eval_preprocessing_id = get_evaluation_preprocessing_id(self.config)
             state_dict = {
                 'epoch': epoch,
                 'model_state': self.model.state_dict(),
@@ -457,10 +582,12 @@ class Trainer:
                 'metrics': metrics,
                 'best_epoch': self.best_epoch,
                 'best_metric': self.best_metric,
+                'best_model_state': self.best_model_state,
                 'rng_state': rng_state,
                 'run_identity': run_id_dict,
                 'config_hash': run_id_dict.get("config_hash"),
-                'schema_version': "1.0",
+                'evaluation_preprocessing_id': eval_preprocessing_id,
+                'schema_version': "2.0",
                 'checkpoint_type': "latest"
             }
             is_final_epoch = (epoch >= epochs)
@@ -470,6 +597,7 @@ class Trainer:
                 "seed": self.config.get("experiment", {}).get("seed", 42),
                 "split_hash": run_id_dict["split_hash"],
                 "config_hash": run_id_dict.get("config_hash"),
+                "evaluation_preprocessing_id": eval_preprocessing_id,
                 "latest_training_state": "completed" if is_final_epoch else "running"
             }
             self.ckpt_manager.save_checkpoint(

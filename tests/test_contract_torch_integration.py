@@ -16,7 +16,7 @@ class ContractTorchIntegrationTests(unittest.TestCase):
         self.metadata = RunMetadata(
             "torch_contract_seed42", "resnet18", "recipe_a", 42, "best_model.pt", 2,
             0.625, "37a0b25b0d19c41318705a236055a7f375d9729dc51b8aa5d2b070f7716c9f91",
-            "5256477cf00b8bcaec855fb96067bcbe6e718235b083b92261dd407b501f989e",
+            "dc9cb66d30e90972331e408340d0f00d8006e829665c79ddc254c7bb853f0862",
         )
 
     def test_checkpoint_metadata_and_percent_conversion(self):
