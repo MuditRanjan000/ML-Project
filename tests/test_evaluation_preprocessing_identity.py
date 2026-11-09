@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 
 from src.data.transforms import (
@@ -41,6 +42,17 @@ class TinyDummyModel(nn.Module):
         if x.dim() > 2:
             x = x.flatten(start_dim=1)
         return self.fc(x)
+
+
+def create_dummy_loaders(n_samples: int = 32, in_features: int = 16, num_classes: int = 100, batch_size: int = 8):
+    g = torch.Generator().manual_seed(42)
+    X = torch.randn(n_samples, in_features, generator=g)
+    y = torch.randint(0, num_classes, (n_samples,), generator=g)
+    train_ds = TensorDataset(X[:24], y[:24])
+    val_ds = TensorDataset(X[24:], y[24:])
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
 
 
 class TestEvaluationPreprocessingIdentity(unittest.TestCase):
@@ -342,6 +354,273 @@ class TestEvaluationPreprocessingIdentity(unittest.TestCase):
         saved_df = pd.read_csv(written_csv)
         self.assertEqual(saved_df["evaluation_preprocessing_config_id"].iloc[0], FROZEN_EVALUATION_PREPROCESSING_ID)
         self.assertEqual(saved_df["evaluation_preprocessing_descriptor_sha256"].iloc[0], EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
+
+    def test_12_fit_validates_preprocessing_before_first_epoch(self):
+        """Assert Trainer.fit validates preprocessing before epoch 1, producing no updates or checkpoints."""
+        # 1. Setup with altered evaluation normalization
+        bad_norm_cfg = copy.deepcopy(self.base_config)
+        bad_norm_cfg["data"]["normalization"] = {"mean": [0.99, 0.99, 0.99], "std": [0.2675, 0.2565, 0.2761]}
+        bad_norm_cfg["training"]["epochs"] = 2
+        ckpt_dir = Path(self.test_dir) / "checkpoints_test12"
+
+        model = TinyDummyModel()
+        initial_weights = {k: v.clone() for k, v in model.state_dict().items()}
+        trainer = self._build_trainer(config=bad_norm_cfg, model=model, ckpt_dir=ckpt_dir)
+        train_loader, val_loader = create_dummy_loaders()
+
+        # 2. Invoke Trainer.fit and verify immediate failure
+        with self.assertRaises(ValueError) as ctx:
+            trainer.fit(train_loader, val_loader)
+        self.assertIn("active descriptor SHA-256", str(ctx.exception))
+
+        # 3. Confirm zero progress, zero optimizer updates, and zero checkpoints
+        self.assertEqual(trainer.start_epoch, 1)
+        self.assertEqual(trainer.best_epoch, 0)
+        self.assertEqual(trainer.best_metric, -float("inf"))
+        self.assertIsNone(trainer.best_model_state)
+        for k, v in model.state_dict().items():
+            self.assertTrue(torch.equal(v, initial_weights[k]), f"Weight {k} was altered before epoch 1!")
+        self.assertFalse((ckpt_dir / "latest_model.pt").exists())
+        self.assertFalse((ckpt_dir / "best_model.pt").exists())
+
+        # 4. Also test with explicit invalid evaluation_preprocessing_id in config
+        bad_id_cfg = copy.deepcopy(self.base_config)
+        bad_id_cfg["evaluation"] = {"evaluation_preprocessing_id": "invalid_id_9999"}
+        bad_id_cfg["training"]["epochs"] = 2
+        ckpt_dir_id = Path(self.test_dir) / "checkpoints_test12_id"
+        trainer_id = self._build_trainer(config=bad_id_cfg, model=TinyDummyModel(), ckpt_dir=ckpt_dir_id)
+        with self.assertRaises(ValueError) as ctx2:
+            trainer_id.fit(train_loader, val_loader)
+        self.assertIn("Evaluation preprocessing protocol ID mismatch", str(ctx2.exception))
+        self.assertFalse((ckpt_dir_id / "latest_model.pt").exists())
+
+    def test_13_reconciliation_repairs_latest_metadata_sidecar_provenance(self):
+        """Assert reconciliation repairs altered or missing identifiers in latest_metadata.json while preserving unrelated fields."""
+        cfg = copy.deepcopy(self.base_config)
+        cfg["training"]["epochs"] = 1
+        ckpt_dir = Path(self.test_dir) / "checkpoints_test13"
+        trainer = self._build_trainer(config=cfg, ckpt_dir=ckpt_dir)
+        train_loader, val_loader = create_dummy_loaders()
+        trainer.fit(train_loader, val_loader)
+
+        latest_json = ckpt_dir / "latest_metadata.json"
+        self.assertTrue(latest_json.is_file())
+
+        # Add unrelated custom metadata fields to the sidecar
+        with open(latest_json, "r", encoding="utf-8") as f:
+            sidecar = json.load(f)
+        sidecar["custom_experiment_note"] = "preserved_custom_value"
+        sidecar["user_audit_tag"] = 12345
+        with open(latest_json, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+
+        # 1. Modify protocol ID in parseable sidecar
+        sidecar["evaluation_preprocessing_id"] = "corrupted_sidecar_protocol_id"
+        with open(latest_json, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+
+        repaired = CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertTrue(repaired, "Reconciliation must detect altered protocol ID and repair sidecar")
+
+        with open(latest_json, "r", encoding="utf-8") as f:
+            repaired_sidecar = json.load(f)
+        self.assertEqual(repaired_sidecar["evaluation_preprocessing_id"], FROZEN_EVALUATION_PREPROCESSING_ID)
+        self.assertEqual(repaired_sidecar["evaluation_preprocessing_descriptor_sha256"], EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
+        self.assertEqual(repaired_sidecar.get("custom_experiment_note"), "preserved_custom_value")
+        self.assertEqual(repaired_sidecar.get("user_audit_tag"), 12345)
+
+        # 2. Modify descriptor fingerprint in parseable sidecar
+        repaired_sidecar["evaluation_preprocessing_descriptor_sha256"] = "corrupted_descriptor_fingerprint"
+        with open(latest_json, "w", encoding="utf-8") as f:
+            json.dump(repaired_sidecar, f)
+
+        repaired2 = CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertTrue(repaired2, "Reconciliation must detect altered descriptor sha256 and repair sidecar")
+
+        with open(latest_json, "r", encoding="utf-8") as f:
+            repaired_sidecar2 = json.load(f)
+        self.assertEqual(repaired_sidecar2["evaluation_preprocessing_descriptor_sha256"], EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
+        self.assertEqual(repaired_sidecar2["evaluation_preprocessing_id"], FROZEN_EVALUATION_PREPROCESSING_ID)
+        self.assertEqual(repaired_sidecar2.get("custom_experiment_note"), "preserved_custom_value")
+        self.assertEqual(repaired_sidecar2.get("user_audit_tag"), 12345)
+
+    def test_14_reconciliation_repairs_best_metadata_sidecar_provenance(self):
+        """Assert reconciliation repairs altered or missing identifiers in best_metadata.json while preserving unrelated fields."""
+        cfg = copy.deepcopy(self.base_config)
+        cfg["training"]["epochs"] = 1
+        ckpt_dir = Path(self.test_dir) / "checkpoints_test14"
+        trainer = self._build_trainer(config=cfg, ckpt_dir=ckpt_dir)
+        train_loader, val_loader = create_dummy_loaders()
+        trainer.fit(train_loader, val_loader)
+
+        best_json = ckpt_dir / "best_metadata.json"
+        self.assertTrue(best_json.is_file())
+
+        with open(best_json, "r", encoding="utf-8") as f:
+            sidecar = json.load(f)
+        sidecar["custom_best_label"] = "golden_candidate_v1"
+        sidecar["best_extra_flag"] = True
+        with open(best_json, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+
+        # 1. Modify protocol ID in best_metadata.json
+        sidecar["evaluation_preprocessing_id"] = "tampered_best_protocol_id"
+        with open(best_json, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+
+        repaired = CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertTrue(repaired)
+
+        with open(best_json, "r", encoding="utf-8") as f:
+            repaired_best = json.load(f)
+        self.assertEqual(repaired_best["evaluation_preprocessing_id"], FROZEN_EVALUATION_PREPROCESSING_ID)
+        self.assertEqual(repaired_best["evaluation_preprocessing_descriptor_sha256"], EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
+        self.assertEqual(repaired_best.get("custom_best_label"), "golden_candidate_v1")
+        self.assertEqual(repaired_best.get("best_extra_flag"), True)
+
+        # 2. Modify descriptor sha256 in best_metadata.json
+        repaired_best["evaluation_preprocessing_descriptor_sha256"] = "tampered_best_sha"
+        with open(best_json, "w", encoding="utf-8") as f:
+            json.dump(repaired_best, f)
+
+        repaired2 = CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertTrue(repaired2)
+
+        with open(best_json, "r", encoding="utf-8") as f:
+            repaired_best2 = json.load(f)
+        self.assertEqual(repaired_best2["evaluation_preprocessing_descriptor_sha256"], EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
+        self.assertEqual(repaired_best2["evaluation_preprocessing_id"], FROZEN_EVALUATION_PREPROCESSING_ID)
+        self.assertEqual(repaired_best2.get("custom_best_label"), "golden_candidate_v1")
+        self.assertEqual(repaired_best2.get("best_extra_flag"), True)
+
+    def test_15_reconciliation_fails_closed_on_inconsistent_checkpoint_payload(self):
+        """Assert reconciliation fails closed if authoritative checkpoint payload is missing or internally inconsistent."""
+        cfg = copy.deepcopy(self.base_config)
+        ckpt_dir = Path(self.test_dir) / "checkpoints_test15"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Metadata sidecar exists without any checkpoint payload -> FileNotFoundError
+        orphan_json = ckpt_dir / "latest_metadata.json"
+        orphan_json.write_text(json.dumps({"latest_epoch": 1}), encoding="utf-8")
+        with self.assertRaises(FileNotFoundError) as ctx1:
+            CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertIn("authoritative checkpoint payload", str(ctx1.exception))
+        orphan_json.unlink()
+
+        # 2. Authoritative latest_model.pt has tampered evaluation_preprocessing_id -> ValueError
+        latest_pt = ckpt_dir / "latest_model.pt"
+        trainer = self._build_trainer(config=cfg, ckpt_dir=ckpt_dir)
+        run_id_dict = trainer._get_run_identity()
+        bad_payload = {
+            "epoch": 1,
+            "model_state": trainer.model.state_dict(),
+            "best_epoch": 1,
+            "best_metric": 50.0,
+            "best_model_state": trainer.model.state_dict(),
+            "run_identity": run_id_dict,
+            "config_hash": run_id_dict["config_hash"],
+            "evaluation_preprocessing_id": "tampered_checkpoint_id",
+            "evaluation_preprocessing_descriptor_sha256": EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256,
+            "schema_version": "2.0",
+            "checkpoint_type": "latest"
+        }
+        torch.save(bad_payload, latest_pt)
+        with self.assertRaises(ValueError) as ctx2:
+            CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertIn("Evaluation preprocessing protocol ID mismatch", str(ctx2.exception))
+
+        # 3. Authoritative latest_model.pt has tampered evaluation_preprocessing_descriptor_sha256 -> ValueError
+        bad_payload["evaluation_preprocessing_id"] = FROZEN_EVALUATION_PREPROCESSING_ID
+        bad_payload["evaluation_preprocessing_descriptor_sha256"] = "tampered_payload_sha"
+        torch.save(bad_payload, latest_pt)
+        with self.assertRaises(ValueError) as ctx3:
+            CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertIn("Evaluation preprocessing descriptor SHA-256 mismatch", str(ctx3.exception))
+
+        # 4. Authoritative latest_model.pt is missing required provenance field -> ValueError
+        del bad_payload["evaluation_preprocessing_descriptor_sha256"]
+        torch.save(bad_payload, latest_pt)
+        with self.assertRaises(ValueError) as ctx4:
+            CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+        self.assertIn("missing required field", str(ctx4.exception))
+
+    def test_16_reconciliation_reconstructs_missing_best_model_pt(self):
+        """Assert reconciliation reconstructs a missing best_model.pt from authoritative latest_model.pt."""
+        cfg = copy.deepcopy(self.base_config)
+        cfg["training"]["epochs"] = 1
+        ckpt_dir = Path(self.test_dir) / "checkpoints_test16"
+        trainer = self._build_trainer(config=cfg, ckpt_dir=ckpt_dir)
+        train_loader, val_loader = create_dummy_loaders()
+        trainer.fit(train_loader, val_loader)
+
+        latest_pt = ckpt_dir / "latest_model.pt"
+        best_pt = ckpt_dir / "best_model.pt"
+        latest_json = ckpt_dir / "latest_metadata.json"
+        best_json = ckpt_dir / "best_metadata.json"
+
+        # 1. Verify minimal training run produced all 4 artifacts
+        self.assertTrue(latest_pt.is_file(), "latest_model.pt must exist")
+        self.assertTrue(best_pt.is_file(), "best_model.pt must exist")
+        self.assertTrue(latest_json.is_file(), "latest_metadata.json must exist")
+        self.assertTrue(best_json.is_file(), "best_metadata.json must exist")
+
+        # 2. Load and inspect latest_model.pt to confirm complete, valid embedded best-model snapshot
+        latest_ckpt = torch.load(latest_pt, map_location="cpu")
+        self.assertIn("best_model_state", latest_ckpt, "latest_model.pt must contain embedded best_model_state")
+        self.assertIsInstance(latest_ckpt["best_model_state"], dict)
+        self.assertTrue(len(latest_ckpt["best_model_state"]) > 0)
+
+        # 3. Record embedded best-model weights, best epoch, best metric, approved preprocessing protocol ID and descriptor fingerprint
+        embedded_weights = latest_ckpt["best_model_state"]
+        expected_best_epoch = latest_ckpt["best_epoch"]
+        expected_best_metric = latest_ckpt["best_metric"]
+        expected_eval_id = latest_ckpt["evaluation_preprocessing_id"]
+        expected_eval_sha256 = latest_ckpt["evaluation_preprocessing_descriptor_sha256"]
+
+        self.assertEqual(expected_eval_id, FROZEN_EVALUATION_PREPROCESSING_ID)
+        self.assertEqual(expected_eval_sha256, EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
+
+        # 4. Delete only best_model.pt. Leave latest_model.pt, its embedded snapshot, and best_metadata.json untouched
+        best_pt.unlink()
+        self.assertFalse(best_pt.exists(), "best_model.pt must be deleted for this test")
+        self.assertTrue(latest_pt.exists(), "latest_model.pt must remain untouched")
+        self.assertTrue(best_json.exists(), "best_metadata.json must remain untouched")
+
+        # 5. Call CheckpointManager.reconcile_checkpoints()
+        repaired = CheckpointManager.reconcile_checkpoints(ckpt_dir, cfg)
+
+        # 6. Assertions
+        # - Reconciliation succeeds and reports repair (True)
+        self.assertTrue(repaired, "reconcile_checkpoints must report repair when best_model.pt was missing")
+        # - best_model.pt is recreated
+        self.assertTrue(best_pt.is_file(), "best_model.pt must be recreated by reconciliation")
+
+        # - Inspect recreated best_model.pt
+        recreated_best = torch.load(best_pt, map_location="cpu")
+        self.assertEqual(recreated_best["checkpoint_type"], "best")
+        self.assertEqual(recreated_best["epoch"], expected_best_epoch)
+        self.assertEqual(recreated_best["best_epoch"], expected_best_epoch)
+        self.assertEqual(recreated_best["best_metric"], expected_best_metric)
+        self.assertEqual(recreated_best["evaluation_preprocessing_id"], FROZEN_EVALUATION_PREPROCESSING_ID)
+        self.assertEqual(recreated_best["evaluation_preprocessing_descriptor_sha256"], EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
+
+        # - Recreated model weights identical to embedded best snapshot
+        self.assertEqual(set(recreated_best["model_state"].keys()), set(embedded_weights.keys()))
+        for k, v in embedded_weights.items():
+            self.assertTrue(
+                torch.equal(recreated_best["model_state"][k], v.cpu()),
+                f"Weight tensor for key '{k}' does not match embedded best snapshot"
+            )
+
+        # - The existing metadata sidecar is valid and consistent
+        self.assertTrue(best_json.is_file(), "best_metadata.json must still exist")
+        with open(best_json, "r", encoding="utf-8") as f:
+            sidecar = json.load(f)
+        self.assertEqual(sidecar["checkpoint_identifier"], "best_model.pt")
+        self.assertEqual(sidecar["best_epoch"], expected_best_epoch)
+        self.assertEqual(sidecar["best_validation_accuracy"], expected_best_metric)
+        self.assertEqual(sidecar["evaluation_preprocessing_id"], FROZEN_EVALUATION_PREPROCESSING_ID)
+        self.assertEqual(sidecar["evaluation_preprocessing_descriptor_sha256"], EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256)
 
 
 if __name__ == "__main__":

@@ -534,6 +534,23 @@ class Trainer:
         Full training loop with resumption support.
         Optionally halts at `stop_at_epoch` to simulate an interruption.
         """
+        # Validate active evaluation preprocessing configuration before starting training
+        candidate_eval_id = (
+            self.config.get("evaluation", {}).get("evaluation_preprocessing_id")
+            or self.config.get("data", {}).get("evaluation_preprocessing_id")
+            or get_evaluation_preprocessing_id(self.config)
+        )
+        candidate_desc_sha256 = (
+            self.config.get("evaluation", {}).get("evaluation_preprocessing_descriptor_sha256")
+            or self.config.get("data", {}).get("evaluation_preprocessing_descriptor_sha256")
+            or get_evaluation_preprocessing_descriptor_sha256(self.config)
+        )
+        validate_evaluation_preprocessing(
+            config=self.config,
+            evaluation_preprocessing_id=candidate_eval_id,
+            evaluation_preprocessing_descriptor_sha256=candidate_desc_sha256
+        )
+
         epochs = self.config.get('training', {}).get('epochs', 100)
         target_epochs = min(epochs, stop_at_epoch) if stop_at_epoch is not None else epochs
 

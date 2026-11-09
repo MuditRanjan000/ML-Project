@@ -5,6 +5,12 @@ from pathlib import Path
 from typing import Dict, Any, Union, Optional
 import torch
 
+from src.data.transforms import (
+    validate_evaluation_preprocessing,
+    FROZEN_EVALUATION_PREPROCESSING_ID,
+    EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256,
+)
+
 class CheckpointManager:
     """
     Manages saving, loading, and reconciling model checkpoints with atomic interruption-safe writes.
@@ -88,137 +94,269 @@ class CheckpointManager:
                 pass
 
         latest_pt = ckpt_dir / "latest_model.pt"
-        if not latest_pt.is_file():
-            # No authoritative latest checkpoint exists
-            return False
-
-        try:
-            latest_ckpt = torch.load(latest_pt, map_location="cpu")
-        except Exception as e:
-            raise RuntimeError(
-                f"Authoritative latest checkpoint '{latest_pt}' is corrupt or unreadable: {e}. "
-                "Resumption cannot proceed with a corrupted authoritative checkpoint."
-            ) from e
-
-        if not isinstance(latest_ckpt, dict):
-            raise ValueError(
-                f"Authoritative checkpoint '{latest_pt}' payload is invalid (not a dictionary)."
-            )
-
-        required_keys = ["epoch", "model_state", "best_epoch", "best_metric", "best_model_state"]
-        for key in required_keys:
-            if key not in latest_ckpt or latest_ckpt[key] is None:
-                raise ValueError(
-                    f"Authoritative checkpoint '{latest_pt}' is missing required recovery field '{key}'. "
-                    "Cannot safely reconcile checkpoint state."
-                )
-
-        repaired = False
-        authoritative_epoch = int(latest_ckpt["epoch"])
-        authoritative_best_epoch = int(latest_ckpt["best_epoch"])
-        authoritative_best_metric = float(latest_ckpt["best_metric"])
-        schema_version = latest_ckpt.get("schema_version", "2.0")
-
-        # 1. Reconcile / Repair latest_metadata.json
-        latest_json = ckpt_dir / "latest_metadata.json"
-        needs_latest_meta_repair = True
-        if latest_json.is_file():
-            try:
-                with open(latest_json, "r", encoding="utf-8") as f:
-                    curr_latest_meta = json.load(f)
-                if (
-                    curr_latest_meta.get("latest_epoch") == authoritative_epoch
-                    and curr_latest_meta.get("best_epoch") == authoritative_best_epoch
-                    and curr_latest_meta.get("checkpoint_identifier") == "latest_model.pt"
-                ):
-                    needs_latest_meta_repair = False
-            except Exception:
-                needs_latest_meta_repair = True
-
-        if needs_latest_meta_repair:
-            logger.warning(f"Reconciling stale/missing latest_metadata.json from {latest_pt.name}")
-            latest_metadata = {
-                "latest_epoch": authoritative_epoch,
-                "latest_training_state": latest_ckpt.get("latest_training_state", "running"),
-                "metric": float(latest_ckpt.get("metrics", {}).get("accuracy", authoritative_best_metric)),
-                "best_epoch": authoritative_best_epoch,
-                "best_validation_accuracy": authoritative_best_metric,
-                "checkpoint_identifier": "latest_model.pt",
-                "schema_version": schema_version,
-                "config_hash": latest_ckpt.get("config_hash"),
-                "evaluation_preprocessing_id": latest_ckpt.get("evaluation_preprocessing_id"),
-                "evaluation_preprocessing_descriptor_sha256": latest_ckpt.get("evaluation_preprocessing_descriptor_sha256"),
-                "split_hash": latest_ckpt.get("run_identity", {}).get("split_hash")
-            }
-            if latest_ckpt.get("best_metadata"):
-                latest_metadata.update({
-                    k: v for k, v in latest_ckpt["best_metadata"].items()
-                    if k not in ["checkpoint_identifier", "latest_epoch", "metric"]
-                })
-            cls._atomic_json_save(latest_metadata, latest_json)
-            repaired = True
-
-        # 2. Reconcile / Repair best_model.pt and best_metadata.json
         best_pt = ckpt_dir / "best_model.pt"
+        latest_json = ckpt_dir / "latest_metadata.json"
         best_json = ckpt_dir / "best_metadata.json"
 
-        needs_best_repair = False
-        if not best_pt.is_file() or not best_json.is_file():
-            needs_best_repair = True
-        else:
+        if not latest_pt.is_file() and not best_pt.is_file():
+            # If sidecars exist without any checkpoint payload, fail closed
+            if latest_json.is_file() or best_json.is_file():
+                raise FileNotFoundError(
+                    f"Cannot reconcile checkpoint sidecars in '{ckpt_dir}': "
+                    "authoritative checkpoint payload (latest_model.pt or best_model.pt) is missing."
+                )
+            return False
+
+        if latest_pt.is_file():
             try:
-                with open(best_json, "r", encoding="utf-8") as f:
-                    curr_best_meta = json.load(f)
-                if (
-                    curr_best_meta.get("best_epoch") != authoritative_best_epoch
-                    or curr_best_meta.get("best_validation_accuracy") != authoritative_best_metric
-                ):
-                    needs_best_repair = True
-                else:
+                latest_ckpt = torch.load(latest_pt, map_location="cpu")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Authoritative latest checkpoint '{latest_pt}' is corrupt or unreadable: {e}. "
+                    "Resumption cannot proceed with a corrupted authoritative checkpoint."
+                ) from e
+
+            if not isinstance(latest_ckpt, dict):
+                raise ValueError(
+                    f"Authoritative checkpoint '{latest_pt}' payload is invalid (not a dictionary)."
+                )
+
+            required_keys = ["epoch", "model_state", "best_epoch", "best_metric", "best_model_state"]
+            for key in required_keys:
+                if key not in latest_ckpt or latest_ckpt[key] is None:
+                    raise ValueError(
+                        f"Authoritative checkpoint '{latest_pt}' is missing required recovery field '{key}'. "
+                        "Cannot safely reconcile checkpoint state."
+                    )
+
+            # Validate authoritative preprocessing provenance
+            auth_eval_id = latest_ckpt.get("evaluation_preprocessing_id")
+            auth_eval_sha256 = latest_ckpt.get("evaluation_preprocessing_descriptor_sha256")
+            if not isinstance(auth_eval_id, str) or not auth_eval_id:
+                raise ValueError(
+                    f"Authoritative checkpoint '{latest_pt}' is missing required field 'evaluation_preprocessing_id'."
+                )
+            if not isinstance(auth_eval_sha256, str) or not auth_eval_sha256:
+                raise ValueError(
+                    f"Authoritative checkpoint '{latest_pt}' is missing required field 'evaluation_preprocessing_descriptor_sha256'."
+                )
+
+            # Validate against frozen protocol identifier and descriptor SHA-256
+            validate_evaluation_preprocessing(
+                config=config,
+                evaluation_preprocessing_id=auth_eval_id,
+                evaluation_preprocessing_descriptor_sha256=auth_eval_sha256
+            )
+
+            # Check internal consistency with run_identity if present
+            if isinstance(latest_ckpt.get("run_identity"), dict):
+                run_id_dict = latest_ckpt["run_identity"]
+                if run_id_dict.get("evaluation_preprocessing_id") != auth_eval_id:
+                    raise ValueError(
+                        f"Authoritative checkpoint '{latest_pt}' is internally inconsistent: "
+                        f"run_identity has evaluation_preprocessing_id='{run_id_dict.get('evaluation_preprocessing_id')}', "
+                        f"but payload has '{auth_eval_id}'."
+                    )
+                if run_id_dict.get("evaluation_preprocessing_descriptor_sha256") != auth_eval_sha256:
+                    raise ValueError(
+                        f"Authoritative checkpoint '{latest_pt}' is internally inconsistent: "
+                        f"run_identity has evaluation_preprocessing_descriptor_sha256='{run_id_dict.get('evaluation_preprocessing_descriptor_sha256')}', "
+                        f"but payload has '{auth_eval_sha256}'."
+                    )
+
+            repaired = False
+            authoritative_epoch = int(latest_ckpt["epoch"])
+            authoritative_best_epoch = int(latest_ckpt["best_epoch"])
+            authoritative_best_metric = float(latest_ckpt["best_metric"])
+            schema_version = latest_ckpt.get("schema_version", "2.0")
+
+            # 1. Reconcile / Repair latest_metadata.json
+            needs_latest_meta_repair = True
+            curr_latest_meta = None
+            if latest_json.is_file():
+                try:
+                    with open(latest_json, "r", encoding="utf-8") as f:
+                        curr_latest_meta = json.load(f)
+                    if (
+                        isinstance(curr_latest_meta, dict)
+                        and curr_latest_meta.get("latest_epoch") == authoritative_epoch
+                        and curr_latest_meta.get("best_epoch") == authoritative_best_epoch
+                        and curr_latest_meta.get("checkpoint_identifier") == "latest_model.pt"
+                        and curr_latest_meta.get("evaluation_preprocessing_id") == auth_eval_id
+                        and curr_latest_meta.get("evaluation_preprocessing_descriptor_sha256") == auth_eval_sha256
+                    ):
+                        needs_latest_meta_repair = False
+                except Exception:
+                    needs_latest_meta_repair = True
+
+            if needs_latest_meta_repair:
+                logger.warning(f"Reconciling stale/missing/inconsistent latest_metadata.json from {latest_pt.name}")
+                repaired_latest_meta = dict(curr_latest_meta) if isinstance(curr_latest_meta, dict) else {}
+                repaired_latest_meta.update({
+                    "latest_epoch": authoritative_epoch,
+                    "latest_training_state": latest_ckpt.get("latest_training_state", repaired_latest_meta.get("latest_training_state", "running")),
+                    "metric": float(latest_ckpt.get("metrics", {}).get("accuracy", authoritative_best_metric)),
+                    "best_epoch": authoritative_best_epoch,
+                    "best_validation_accuracy": authoritative_best_metric,
+                    "checkpoint_identifier": "latest_model.pt",
+                    "schema_version": schema_version,
+                    "config_hash": latest_ckpt.get("config_hash", repaired_latest_meta.get("config_hash")),
+                    "evaluation_preprocessing_id": auth_eval_id,
+                    "evaluation_preprocessing_descriptor_sha256": auth_eval_sha256,
+                    "split_hash": latest_ckpt.get("run_identity", {}).get("split_hash", repaired_latest_meta.get("split_hash"))
+                })
+                if latest_ckpt.get("best_metadata"):
+                    for k, v in latest_ckpt["best_metadata"].items():
+                        if k not in ["checkpoint_identifier", "latest_epoch", "metric"]:
+                            repaired_latest_meta.setdefault(k, v)
+                cls._atomic_json_save(repaired_latest_meta, latest_json)
+                repaired = True
+
+            # 2. Reconcile / Repair best_model.pt and best_metadata.json
+            needs_best_pt_repair = False
+            if not best_pt.is_file():
+                needs_best_pt_repair = True
+            else:
+                try:
                     best_ckpt = torch.load(best_pt, map_location="cpu")
                     if (
-                        best_ckpt.get("epoch") != authoritative_best_epoch
+                        not isinstance(best_ckpt, dict)
+                        or best_ckpt.get("epoch") != authoritative_best_epoch
                         or best_ckpt.get("best_epoch") != authoritative_best_epoch
+                        or best_ckpt.get("evaluation_preprocessing_id") != auth_eval_id
+                        or best_ckpt.get("evaluation_preprocessing_descriptor_sha256") != auth_eval_sha256
+                        or "model_state" not in best_ckpt
                     ):
-                        needs_best_repair = True
-            except Exception:
-                needs_best_repair = True
+                        needs_best_pt_repair = True
+                except Exception:
+                    needs_best_pt_repair = True
 
-        if needs_best_repair:
-            logger.warning(
-                f"Reconciling best_model.pt and best_metadata.json to match authoritative "
-                f"best epoch {authoritative_best_epoch} ({authoritative_best_metric:.2f}%)"
+            needs_best_meta_repair = False
+            curr_best_meta = None
+            if not best_json.is_file():
+                needs_best_meta_repair = True
+            else:
+                try:
+                    with open(best_json, "r", encoding="utf-8") as f:
+                        curr_best_meta = json.load(f)
+                    if (
+                        not isinstance(curr_best_meta, dict)
+                        or curr_best_meta.get("best_epoch") != authoritative_best_epoch
+                        or curr_best_meta.get("best_validation_accuracy") != authoritative_best_metric
+                        or curr_best_meta.get("checkpoint_identifier") != "best_model.pt"
+                        or curr_best_meta.get("evaluation_preprocessing_id") != auth_eval_id
+                        or curr_best_meta.get("evaluation_preprocessing_descriptor_sha256") != auth_eval_sha256
+                    ):
+                        needs_best_meta_repair = True
+                except Exception:
+                    needs_best_meta_repair = True
+
+            if needs_best_pt_repair:
+                logger.warning(
+                    f"Reconciling best_model.pt to match authoritative "
+                    f"best epoch {authoritative_best_epoch} ({authoritative_best_metric:.2f}%)"
+                )
+                best_state = {
+                    "epoch": authoritative_best_epoch,
+                    "model_state": latest_ckpt["best_model_state"],
+                    "best_epoch": authoritative_best_epoch,
+                    "best_metric": authoritative_best_metric,
+                    "checkpoint_type": "best",
+                    "schema_version": schema_version,
+                    "run_identity": latest_ckpt.get("run_identity"),
+                    "config_hash": latest_ckpt.get("config_hash"),
+                    "evaluation_preprocessing_id": auth_eval_id,
+                    "evaluation_preprocessing_descriptor_sha256": auth_eval_sha256,
+                }
+                cls._atomic_torch_save(best_state, best_pt)
+                repaired = True
+
+            if needs_best_meta_repair:
+                logger.warning(
+                    f"Reconciling best_metadata.json to match authoritative "
+                    f"best epoch {authoritative_best_epoch} ({authoritative_best_metric:.2f}%)"
+                )
+                repaired_best_meta = dict(curr_best_meta) if isinstance(curr_best_meta, dict) else {}
+                repaired_best_meta.update({
+                    "best_epoch": authoritative_best_epoch,
+                    "best_validation_accuracy": authoritative_best_metric,
+                    "checkpoint_identifier": "best_model.pt",
+                    "schema_version": schema_version,
+                    "config_hash": latest_ckpt.get("config_hash", repaired_best_meta.get("config_hash")),
+                    "evaluation_preprocessing_id": auth_eval_id,
+                    "evaluation_preprocessing_descriptor_sha256": auth_eval_sha256,
+                    "split_hash": latest_ckpt.get("run_identity", {}).get("split_hash", repaired_best_meta.get("split_hash"))
+                })
+                if latest_ckpt.get("best_metadata"):
+                    for k, v in latest_ckpt["best_metadata"].items():
+                        repaired_best_meta.setdefault(k, v)
+                cls._atomic_json_save(repaired_best_meta, best_json)
+                repaired = True
+
+            return repaired
+
+        else:
+            # latest_model.pt does not exist, but best_model.pt exists (standalone best artifact)
+            try:
+                best_ckpt = torch.load(best_pt, map_location="cpu")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Authoritative checkpoint '{best_pt}' is corrupt or unreadable: {e}."
+                ) from e
+
+            if not isinstance(best_ckpt, dict):
+                raise ValueError(f"Authoritative checkpoint '{best_pt}' payload is invalid (not a dictionary).")
+
+            auth_best_eval_id = best_ckpt.get("evaluation_preprocessing_id")
+            auth_best_eval_sha256 = best_ckpt.get("evaluation_preprocessing_descriptor_sha256")
+            if not isinstance(auth_best_eval_id, str) or not auth_best_eval_id:
+                raise ValueError(f"Authoritative checkpoint '{best_pt}' is missing required field 'evaluation_preprocessing_id'.")
+            if not isinstance(auth_best_eval_sha256, str) or not auth_best_eval_sha256:
+                raise ValueError(f"Authoritative checkpoint '{best_pt}' is missing required field 'evaluation_preprocessing_descriptor_sha256'.")
+
+            validate_evaluation_preprocessing(
+                config=config,
+                evaluation_preprocessing_id=auth_best_eval_id,
+                evaluation_preprocessing_descriptor_sha256=auth_best_eval_sha256
             )
-            best_state = {
-                "epoch": authoritative_best_epoch,
-                "model_state": latest_ckpt["best_model_state"],
-                "best_epoch": authoritative_best_epoch,
-                "best_metric": authoritative_best_metric,
-                "checkpoint_type": "best",
-                "schema_version": schema_version,
-                "run_identity": latest_ckpt.get("run_identity"),
-                "config_hash": latest_ckpt.get("config_hash"),
-                "evaluation_preprocessing_id": latest_ckpt.get("evaluation_preprocessing_id"),
-                "evaluation_preprocessing_descriptor_sha256": latest_ckpt.get("evaluation_preprocessing_descriptor_sha256"),
-            }
-            cls._atomic_torch_save(best_state, best_pt)
 
-            best_metadata = {
-                "best_epoch": authoritative_best_epoch,
-                "best_validation_accuracy": authoritative_best_metric,
-                "checkpoint_identifier": "best_model.pt",
-                "schema_version": schema_version,
-                "config_hash": latest_ckpt.get("config_hash"),
-                "evaluation_preprocessing_id": latest_ckpt.get("evaluation_preprocessing_id"),
-                "evaluation_preprocessing_descriptor_sha256": latest_ckpt.get("evaluation_preprocessing_descriptor_sha256"),
-                "split_hash": latest_ckpt.get("run_identity", {}).get("split_hash")
-            }
-            if latest_ckpt.get("best_metadata"):
-                best_metadata.update(latest_ckpt["best_metadata"])
-            cls._atomic_json_save(best_metadata, best_json)
-            repaired = True
+            needs_best_meta_repair = False
+            curr_best_meta = None
+            if not best_json.is_file():
+                needs_best_meta_repair = True
+            else:
+                try:
+                    with open(best_json, "r", encoding="utf-8") as f:
+                        curr_best_meta = json.load(f)
+                    if (
+                        not isinstance(curr_best_meta, dict)
+                        or curr_best_meta.get("checkpoint_identifier") != "best_model.pt"
+                        or curr_best_meta.get("evaluation_preprocessing_id") != auth_best_eval_id
+                        or curr_best_meta.get("evaluation_preprocessing_descriptor_sha256") != auth_best_eval_sha256
+                    ):
+                        needs_best_meta_repair = True
+                except Exception:
+                    needs_best_meta_repair = True
 
-        return repaired
+            if needs_best_meta_repair:
+                logger.warning(f"Reconciling stale/missing/inconsistent best_metadata.json from {best_pt.name}")
+                repaired_best_meta = dict(curr_best_meta) if isinstance(curr_best_meta, dict) else {}
+                best_epoch_val = best_ckpt.get("best_epoch", best_ckpt.get("epoch", 1))
+                best_metric_val = float(best_ckpt.get("best_metric", best_ckpt.get("metrics", {}).get("accuracy", 0.0)))
+                repaired_best_meta.update({
+                    "best_epoch": best_epoch_val,
+                    "best_validation_accuracy": best_metric_val,
+                    "checkpoint_identifier": "best_model.pt",
+                    "schema_version": best_ckpt.get("schema_version", "2.0"),
+                    "config_hash": best_ckpt.get("config_hash", repaired_best_meta.get("config_hash")),
+                    "evaluation_preprocessing_id": auth_best_eval_id,
+                    "evaluation_preprocessing_descriptor_sha256": auth_best_eval_sha256,
+                    "split_hash": best_ckpt.get("run_identity", {}).get("split_hash", repaired_best_meta.get("split_hash"))
+                })
+                cls._atomic_json_save(repaired_best_meta, best_json)
+                return True
+
+            return False
 
     def save_checkpoint(
         self,
