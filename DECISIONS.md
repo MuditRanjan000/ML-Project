@@ -14,3 +14,7 @@
 ### [2026-08-31] Recipe B Definition
 *   **Decision:** Recipe B is defined strictly as a COMPOSITE modern-regularization intervention.
 *   **Reason:** The project scopes the effect of the OVERALL training recipe. We do not claim to identify individual component contributions (AdamW, Mixup, etc.).
+
+### [2026-11-10] Compute Infrastructure Update: Primary Execution on NVIDIA A100 GPU
+*   **Decision:** Updated the primary compute infrastructure for the official 12-run experimental matrix to NVIDIA A100 GPU upon confirmation of extended availability. The completed local RTX 3050 timing benchmark is retained as our reference diagnostic baseline.
+*   **Reason:** Provides higher compute throughput and execution stability for official 100-epoch training runs. All frozen experimental parameters (architectures, recipes, seeds 42/43/44, batch size 128, 100 epochs, evaluation protocols, and preprocessing identifiers) remain strictly unchanged.

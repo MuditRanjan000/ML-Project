@@ -271,6 +271,7 @@ class TestEvaluationPreprocessingIdentity(unittest.TestCase):
         run_ckpt_dir.mkdir(parents=True, exist_ok=True)
         best_pt = run_ckpt_dir / "best_model.pt"
         best_json = run_ckpt_dir / "best_metadata.json"
+        latest_pt = run_ckpt_dir / "latest_model.pt"
 
         best_json.write_text(json.dumps({
             "best_epoch": 1,
@@ -289,6 +290,17 @@ class TestEvaluationPreprocessingIdentity(unittest.TestCase):
             "checkpoint_type": "best"
         }
         torch.save(bad_id_ckpt, best_pt)
+        torch.save({
+            "epoch": 1,
+            "best_epoch": 1,
+            "best_metric": 50.0,
+            "model_state": model.state_dict(),
+            "best_model_state": model.state_dict(),
+            "evaluation_preprocessing_id": "tampered_protocol_id",
+            "evaluation_preprocessing_descriptor_sha256": EXPECTED_PREPROCESSING_DESCRIPTOR_SHA256,
+            "schema_version": "2.0",
+            "checkpoint_type": "latest"
+        }, latest_pt)
         with self.assertRaises(ValueError) as ctx:
             evaluator.run_contract_evaluation(run_id)
         self.assertIn("Evaluation preprocessing protocol ID mismatch", str(ctx.exception))
@@ -304,6 +316,17 @@ class TestEvaluationPreprocessingIdentity(unittest.TestCase):
             "checkpoint_type": "best"
         }
         torch.save(bad_sha_ckpt, best_pt)
+        torch.save({
+            "epoch": 1,
+            "best_epoch": 1,
+            "best_metric": 50.0,
+            "model_state": model.state_dict(),
+            "best_model_state": model.state_dict(),
+            "evaluation_preprocessing_id": FROZEN_EVALUATION_PREPROCESSING_ID,
+            "evaluation_preprocessing_descriptor_sha256": "tampered_desc_sha",
+            "schema_version": "2.0",
+            "checkpoint_type": "latest"
+        }, latest_pt)
         with self.assertRaises(ValueError) as ctx:
             evaluator.run_contract_evaluation(run_id)
         self.assertIn("Evaluation preprocessing descriptor SHA-256 mismatch", str(ctx.exception))
